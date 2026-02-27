@@ -105,11 +105,11 @@ def generate_resume_pdf(data: dict) -> bytes:
     tagline = _safe(data.get('tagline', ''))
 
     contact_parts = []
-    for key, icon in [('email','✉'), ('phone','✆'), ('location','⌖'),
-                      ('linkedin','in'), ('github','gh')]:
+    for key, label in [('email','Email:'), ('phone','Phone:'), ('location','Location:'),
+                       ('linkedin','LinkedIn:'), ('github','GitHub:')]:
         val = data.get(key, '').strip()
         if val:
-            contact_parts.append(f"{icon} {_safe(val)}")
+            contact_parts.append(f"{label} {_safe(val)}")
 
     story.append(Paragraph(name, S['name']))
     if tagline:
@@ -158,7 +158,7 @@ def generate_resume_pdf(data: dict) -> bytes:
             for b in exp.get('bullets', []):
                 b = b.strip()
                 if b:
-                    story.append(Paragraph(f"• {_safe(b)}", S['bullet']))
+                    story.append(Paragraph(f"- {_safe(b)}", S['bullet']))
             story.append(Spacer(1, 4))
 
     # ── PROJECTS ──────────────────────────────────────────────────────────────
@@ -178,7 +178,7 @@ def generate_resume_pdf(data: dict) -> bytes:
             for b in proj.get('bullets', []):
                 b = b.strip()
                 if b:
-                    story.append(Paragraph(f"• {_safe(b)}", S['bullet']))
+                    story.append(Paragraph(f"- {_safe(b)}", S['bullet']))
             if link:
                 story.append(Paragraph(
                     f"<font color='#2563EB'>{link}</font>", S['bullet']))
@@ -198,11 +198,14 @@ def generate_resume_pdf(data: dict) -> bytes:
                     Paragraph(items, S['skill_val']),
                 ])
         if skill_rows:
-            t = Table(skill_rows, colWidths=[38*mm, None])
+            # Auto-size category column based on longest category name
+            max_cat_len = max(len(s.get('category','')) for s in skills if s.get('category')) if skills else 10
+            cat_col_w = min(max(max_cat_len * 1.8 * mm, 35*mm), 55*mm)
+            t = Table(skill_rows, colWidths=[cat_col_w, None])
             t.setStyle(TableStyle([
                 ('VALIGN', (0,0), (-1,-1), 'TOP'),
                 ('LEFTPADDING', (0,0), (-1,-1), 0),
-                ('RIGHTPADDING', (0,0), (-1,-1), 4),
+                ('RIGHTPADDING', (0,0), (-1,-1), 6),
                 ('TOPPADDING', (0,0), (-1,-1), 2),
                 ('BOTTOMPADDING', (0,0), (-1,-1), 2),
             ]))
@@ -251,7 +254,7 @@ def generate_resume_pdf(data: dict) -> bytes:
     if certs:
         story += _section_header('Certifications', S)
         for c in certs:
-            story.append(Paragraph(f"• {_safe(c)}", S['bullet']))
+            story.append(Paragraph(f"- {_safe(c)}", S['bullet']))
 
     doc.build(story)
     buf.seek(0)

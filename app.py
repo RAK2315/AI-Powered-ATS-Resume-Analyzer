@@ -8,7 +8,6 @@ import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dotenv import load_dotenv
-# Try .env first, then .env.example (common mistake)
 import pathlib
 _base = pathlib.Path(__file__).parent
 for _f in ['.env', '.env.example', '.env.local']:
@@ -32,7 +31,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+# Reject placeholder values
+_PLACEHOLDERS = ("", "your_key_here", "AIza...", "your-key-here", "your_api_key_here")
+if GEMINI_KEY in _PLACEHOLDERS or len(GEMINI_KEY) < 20:
+    GEMINI_KEY = ""
+# Also try Streamlit secrets (for Streamlit Cloud deployment)
+if not GEMINI_KEY:
+    try:
+        GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
+        if GEMINI_KEY in _PLACEHOLDERS or len(GEMINI_KEY) < 20:
+            GEMINI_KEY = ""
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────────────────
 # GLOBAL CSS
@@ -300,19 +311,13 @@ with st.sidebar:
         st.markdown("""
         <div style='background:rgba(255,184,0,0.08);border:1px solid rgba(255,184,0,0.2);
                     border-radius:8px;padding:0.8rem;font-size:0.78rem;color:#c8a000'>
-            ⚠️ <b>No API key found.</b><br><br>
-            1. Rename <code>.env.example</code> → <code>.env</code><br>
-            2. Replace the placeholder with your key:<br>
-            <code>GEMINI_API_KEY=AIza...</code><br><br>
-            Get free key at aistudio.google.com
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("---")
-        st.markdown("""
-        <div style='background:rgba(0,255,136,0.08);border:1px solid rgba(0,255,136,0.2);
-                    border-radius:8px;padding:0.6rem 0.8rem;font-size:0.78rem;color:#00cc66'>
-            ✅ Gemini AI connected
+            ⚠️ <b>Gemini AI not connected.</b><br><br>
+            <b>Locally:</b> Open <code>.env</code> and set:<br>
+            <code>GEMINI_API_KEY=AIzaSy...</code><br><br>
+            <b>Streamlit Cloud:</b> App Settings → Secrets → add:<br>
+            <code>GEMINI_API_KEY = "AIzaSy..."</code><br><br>
+            <a href='https://aistudio.google.com' target='_blank' style='color:#c8a000'>
+            Get free key at aistudio.google.com →</a>
         </div>
         """, unsafe_allow_html=True)
 
@@ -333,7 +338,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────
 if st.session_state.page == 'builder':
     from pages.cv_builder import render_cv_builder
-    render_cv_builder()
+    render_cv_builder(gemini_key=GEMINI_KEY)
     st.stop()
 
 
@@ -438,6 +443,53 @@ if analyze_clicked:
                     all_improvements.extend(sc.improvement_areas)
 
                 suggester = AISuggester(api_key=GEMINI_KEY or None)
+
+                # ── Ask Gemini for holistic ATS score (more accurate than TF-IDF alone) ──
+                ai_score = None
+                if suggester.model:
+                    try:
+                        score_prompt = (
+                            f"You are an ATS (Applicant Tracking System) expert.\n\n"
+                            f"Rate how well this resume matches the job description on a scale of 0-100.\n\n"
+                            f"RESUME:\n{resume_text[:2000]}\n\n"
+                            f"JOB DESCRIPTION:\n{job_desc[:1200]}\n\n"
+                            f"Candidate type: {mode}\n\n"
+                            f"Scoring criteria (be fair and realistic):\n"
+                            f"- 70-85: Good match, has most required skills, solid projects\n"
+                            f"- 50-69: Decent match, some gaps but promising\n"
+                            f"- 30-49: Partial match, missing several key requirements\n"
+                            f"- 0-29: Poor match, major gaps\n\n"
+                            f"For students/freshers: judge based on projects, skills, and potential — "
+                            f"NOT on missing work experience.\n\n"
+                            f"Return ONLY a JSON object: {{\"score\": <number>, \"reasoning\": \"<1 sentence>\"}}"
+                        )
+                        raw_score_resp = suggester._call_model(score_prompt)
+                        import json, re as _re
+                        raw = raw_score_resp
+                        # Strip markdown code fences
+                        raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+                        raw = _re.sub(r'\s*```\s*$', '', raw).strip()
+                        # Try to find JSON object in response
+                        json_match = _re.search(r'\{[^}]+\}', raw, _re.DOTALL)
+                        if json_match:
+                            raw = json_match.group(0)
+                        parsed_score = json.loads(raw)
+                        ai_score = max(0, min(100, int(float(str(parsed_score['score'])))))
+                        ai_reasoning = str(parsed_score.get('reasoning', ''))[:200]
+                        # Blend: 60% AI + 40% TF-IDF for stability
+                        blended = int(0.6 * ai_score + 0.4 * metrics.normalized_score)
+                        from components.score_calculator import ScoreMetrics
+                        metrics = ScoreMetrics(
+                            raw_similarity=metrics.raw_similarity,
+                            normalized_score=blended,
+                            technical_match=metrics.technical_match,
+                            keyword_density=metrics.keyword_density,
+                            length_ratio=metrics.length_ratio,
+                        )
+                    except Exception:
+                        ai_score = None
+                        ai_reasoning = ''
+
                 suggestions = suggester.generate_suggestions({
                     'score': metrics.normalized_score,
                     'missing_keywords': [k.term for k in ranked_kws[:10]],
@@ -454,6 +506,7 @@ if analyze_clicked:
                     'metrics': metrics, 'ranked_keywords': ranked_kws,
                     'section_scores': section_scores, 'completeness': completeness,
                     'suggestions': suggestions, 'suggester': suggester,
+                    'ai_score': ai_score, 'ai_reasoning': ai_reasoning if ai_score else '',
                 }
                 st.session_state.analysis_done = True
                 st.session_state.fixed_sections = {}
@@ -472,36 +525,48 @@ if st.session_state.analysis_done and st.session_state.results:
     metrics = r['metrics']
     score = metrics.normalized_score
     mode = st.session_state.candidate_mode
+    ai_score = r.get('ai_score')
+    ai_reasoning = r.get('ai_reasoning', '')
 
     st.markdown('<div class="neon-divider"></div>', unsafe_allow_html=True)
-    st.markdown(
-        f"## 📊 Results &nbsp;"
-        f"<span style='font-size:0.8rem;background:rgba(123,47,255,0.2);"
-        f"border:1px solid rgba(123,47,255,0.4);color:#b060ff;"
-        f"padding:0.2rem 0.8rem;border-radius:100px;font-family:Space Mono'>"
-        f"{mode}</span>",
-        unsafe_allow_html=True
-    )
 
-    # ── Score + Quick metrics ──────────────────────────────────────────────
+    # ── Results header row ─────────────────────────────────────────────────
+    h1, h2 = st.columns([3, 1])
+    with h1:
+        st.markdown(
+            f"## 📊 Results &nbsp;"
+            f"<span style='font-size:0.8rem;background:rgba(123,47,255,0.2);"
+            f"border:1px solid rgba(123,47,255,0.4);color:#b060ff;"
+            f"padding:0.2rem 0.8rem;border-radius:100px;font-family:Space Mono'>"
+            f"{mode}</span>",
+            unsafe_allow_html=True)
+    with h2:
+        if st.button("🚀 Implement All in CV Builder", use_container_width=True,
+                     key="implement_all_btn",
+                     help="Jump to CV Builder — auto-fills from your resume with AI improvements"):
+            st.session_state.cv_prefilled = False  # force re-parse prompt
+            st.session_state.page = "builder"
+            st.rerun()
+
+    # ── Score card row ─────────────────────────────────────────────────────
     col_score, col_metrics = st.columns([1, 2], gap="large")
 
     with col_score:
-        sc_cls = "score-high" if score >= 75 else "score-mid" if score >= 50 else "score-low"
-        emoji = "🟢" if score >= 75 else "🟡" if score >= 50 else "🔴"
-        ctx = ("Excellent match!" if score >= 75
-               else "Good — a few tweaks needed." if score >= 50
-               else "Add more JD keywords to improve.")
-        note = ""
-        if score < 50 and "Professional" in mode:
-            note = "<div style='font-size:0.72rem;color:#5a5a7a;margin-top:0.4rem'>Note: Some PDFs suppress scores due to font encoding. Use relative scores across multiple JDs.</div>"
+        sc_cls = "score-high" if score >= 70 else "score-mid" if score >= 45 else "score-low"
+        emoji  = "🟢" if score >= 70 else "🟡" if score >= 45 else "🔴"
+        ctx = ("Strong match! Minor tweaks will make it excellent." if score >= 70
+               else "Good foundation — add missing keywords to improve." if score >= 45
+               else "Needs work — see suggestions below to boost score.")
+        score_method = f"<div style='font-size:0.68rem;color:#5a5a7a;margin-top:0.3rem'>{'🤖 AI-enhanced score' if ai_score else '📐 TF-IDF score'}</div>"
+        ai_note = f"<div style='font-size:0.75rem;color:#9090c8;margin-top:0.5rem;font-style:italic'>\"{ai_reasoning}\"</div>" if ai_reasoning else ""
         st.markdown(f"""
         <div class="score-card">
-            <div style='font-size:0.72rem;color:#7878a0;letter-spacing:0.2em;text-transform:uppercase;margin-bottom:0.4rem'>ATS SCORE</div>
-            <div class="score-number {sc_cls}">{score}</div>
-            <div class="score-label">{emoji} Out of 100</div>
-            <div style='margin-top:0.7rem;font-size:0.85rem;color:#9090b8;font-weight:600'>{ctx}</div>
-            {note}
+          <div style='font-size:0.7rem;color:#9090c0;letter-spacing:0.18em;
+                      text-transform:uppercase;margin-bottom:0.3rem'>ATS SCORE</div>
+          <div class="score-number {sc_cls}" style='font-size:3.2rem'>{score}</div>
+          <div class="score-label" style='font-size:1rem'>{emoji} Out of 100</div>
+          <div style='margin-top:0.5rem;font-size:0.82rem;color:#b0b0d8;font-weight:600'>{ctx}</div>
+          {score_method}{ai_note}
         </div>""", unsafe_allow_html=True)
 
     with col_metrics:
@@ -509,31 +574,34 @@ if st.session_state.analysis_done and st.session_state.results:
         kw_pct   = int(metrics.keyword_density * 100)
         miss_cnt = len(r['ranked_keywords'])
         sec_cnt  = len(r['section_scores'])
-        st.markdown(f"""
-        <div style='display:flex;gap:0.8rem;flex-wrap:wrap'>
-            <div class="metric-card" style='flex:1;min-width:80px'>
-                <div class="metric-value">{tech_pct}%</div>
-                <div class="metric-label">Tech Match</div>
-            </div>
-            <div class="metric-card" style='flex:1;min-width:80px'>
-                <div class="metric-value">{kw_pct}%</div>
-                <div class="metric-label">Keyword Density</div>
-            </div>
-            <div class="metric-card" style='flex:1;min-width:80px'>
-                <div class="metric-value">{miss_cnt}</div>
-                <div class="metric-label">Missing Keywords</div>
-            </div>
-            <div class="metric-card" style='flex:1;min-width:80px'>
-                <div class="metric-value">{sec_cnt}</div>
-                <div class="metric-label">Sections Found</div>
-            </div>
+
+        # Bigger, brighter metric cards
+        def _mcol(val, label, color="#00d4ff"):
+            return f"""<div style='background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);
+                        border-radius:10px;padding:0.9rem 0.6rem;text-align:center;flex:1;min-width:90px'>
+                        <div style='font-size:1.6rem;font-weight:800;color:{color};
+                                    font-family:Space Mono,monospace'>{val}</div>
+                        <div style='font-size:0.75rem;color:#a0a0c0;margin-top:3px;
+                                    text-transform:uppercase;letter-spacing:0.05em'>{label}</div>
+                       </div>"""
+
+        tech_color = "#00d4ff" if tech_pct >= 50 else "#ffbb33" if tech_pct >= 25 else "#ff5566"
+        kw_color   = "#00d4ff" if kw_pct   >= 40 else "#ffbb33" if kw_pct   >= 20 else "#ff5566"
+        miss_color = "#ff5566" if miss_cnt  > 10 else "#ffbb33" if miss_cnt  > 5  else "#00cc66"
+
+        st.markdown(f"""<div style='display:flex;gap:0.7rem;flex-wrap:wrap;margin-bottom:0.8rem'>
+            {_mcol(f"{tech_pct}%", "Tech Match",    tech_color)}
+            {_mcol(f"{kw_pct}%",  "KW Density",    kw_color)}
+            {_mcol(miss_cnt,      "Missing KWs",   miss_color)}
+            {_mcol(sec_cnt,       "Sections Found","#b060ff")}
         </div>""", unsafe_allow_html=True)
 
+        # Missing sections — more visible
         for ms in r['completeness'].missing_sections:
             st.markdown(f"""
-            <div class="missing-section-card">
-                <span style='color:#ff4444'>⚠️</span>&nbsp;
-                <span style='font-size:0.88rem'>Missing <b>{ms.title()}</b> section — add it to boost your ATS score</span>
+            <div style='background:rgba(255,68,68,0.1);border:1px solid rgba(255,68,68,0.3);
+                        border-radius:8px;padding:0.4rem 0.8rem;margin-bottom:0.4rem;font-size:0.85rem'>
+                ⚠️ Missing <b style='color:#ff8888'>{ms.title()}</b> section — add it to boost your score
             </div>""", unsafe_allow_html=True)
 
     # ── TABS ──────────────────────────────────────────────────────────────
@@ -547,45 +615,91 @@ if st.session_state.analysis_done and st.session_state.results:
     with tab_kw:
         ranked = r['ranked_keywords']
         if not ranked:
-            st.success("🎉 No major keyword gaps found!")
+            st.success("🎉 No major keyword gaps found! Your resume covers the JD well.")
         else:
-            st.markdown(f"**{len(ranked)} missing keywords** ranked by importance:")
-            st.markdown("<br>", unsafe_allow_html=True)
+            # Summary bar
+            tech_kws  = [k for k in ranked if k.category == 'technical']
+            soft_kws  = [k for k in ranked if k.category == 'soft_skill']
+            other_kws = [k for k in ranked if k.category not in ('technical','soft_skill')]
+
+            st.markdown(f"""
+            <div style='background:rgba(255,100,100,0.08);border:1px solid rgba(255,100,100,0.2);
+                        border-radius:10px;padding:0.8rem 1.1rem;margin-bottom:1rem'>
+              <span style='font-size:1.1rem;font-weight:800;color:#ff8888'>{len(ranked)}</span>
+              <span style='color:#c0c0d8;font-size:0.9rem'> keywords from the JD are missing from your resume.</span>
+              <br><span style='color:#888;font-size:0.8rem'>
+                🔧 {len(tech_kws)} technical &nbsp;·&nbsp;
+                💡 {len(soft_kws)} soft skills &nbsp;·&nbsp;
+                📌 {len(other_kws)} other
+              </span>
+            </div>""", unsafe_allow_html=True)
+
+            # Color map per category
+            cat_styles = {
+                'technical':         ('#00d4ff', '#0a1a2a', '🔧'),
+                'soft_skill':        ('#b060ff', '#180a2a', '💡'),
+                'industry_specific': ('#ff9900', '#2a1a00', '🏭'),
+                'general':           ('#60c060', '#0a200a', '📌'),
+            }
 
             cats = {}
             for kw in ranked:
                 cats.setdefault(kw.category, []).append(kw)
 
-            cat_info = {
-                'technical':          ('🔧 Technical Skills',      'pill-technical'),
-                'soft_skill':         ('💡 Soft Skills',            'pill-soft_skill'),
-                'industry_specific':  ('🏭 Industry Specific',      'pill-industry_specific'),
-                'general':            ('📌 General Terms',          'pill-general'),
+            cat_labels = {
+                'technical': '🔧 Technical Skills',
+                'soft_skill': '💡 Soft Skills',
+                'industry_specific': '🏭 Industry Specific',
+                'general': '📌 General Terms',
             }
-            for cat, (label, pill_cls) in cat_info.items():
-                if cat not in cats:
-                    continue
-                st.markdown(f"**{label}**")
-                html = '<div class="keyword-container">'
-                for kw in cats[cat][:20]:
-                    html += f'<span class="keyword-pill {pill_cls}">{kw.term}</span>'
-                html += '</div>'
-                st.markdown(html, unsafe_allow_html=True)
-                st.markdown("<br>", unsafe_allow_html=True)
 
-            with st.expander("📋 Top 10 Keywords with Tips"):
-                for kw in ranked[:10]:
-                    _, pill_cls = cat_info.get(kw.category, ('', 'pill-general'))
-                    st.markdown(
-                        f"**{kw.rank}. `{kw.term}`** &nbsp;"
-                        f"<span class='keyword-pill {pill_cls}' style='font-size:0.65rem;padding:0.1rem 0.4rem'>"
-                        f"{kw.category}</span>",
-                        unsafe_allow_html=True
-                    )
-                    st.caption(f"📍 {kw.context}")
-                    for tip in kw.suggestions:
-                        st.caption(f"   → {tip}")
-                    st.markdown("---")
+            for cat, kws in cats.items():
+                color, bg, icon = cat_styles.get(cat, ('#aaaaff', '#111130', '•'))
+                label = cat_labels.get(cat, cat.title())
+                st.markdown(f"<div style='font-size:0.85rem;font-weight:700;color:{color};"
+                            f"margin:1rem 0 0.5rem'>{label}</div>", unsafe_allow_html=True)
+
+                # Card grid — 2 columns
+                cols = st.columns(2)
+                for i, kw in enumerate(kws[:20]):
+                    with cols[i % 2]:
+                        # Importance bar width
+                        imp = max(10, 100 - (kw.rank - 1) * 8)
+                        st.markdown(f"""
+                        <div style='background:{bg};border:1px solid {color}33;border-left:3px solid {color};
+                                    border-radius:8px;padding:0.6rem 0.8rem;margin-bottom:0.5rem'>
+                          <div style='display:flex;justify-content:space-between;align-items:center'>
+                            <span style='font-weight:700;color:{color};font-size:0.88rem'>
+                              {icon} {kw.term}
+                            </span>
+                            <span style='font-size:0.65rem;color:#666;background:rgba(255,255,255,0.05);
+                                         padding:1px 5px;border-radius:4px'>#{kw.rank}</span>
+                          </div>
+                          <div style='background:rgba(255,255,255,0.05);border-radius:3px;
+                                      height:3px;margin:5px 0'>
+                            <div style='background:{color};width:{imp}%;height:3px;border-radius:3px'></div>
+                          </div>
+                          <div style='font-size:0.72rem;color:#888;margin-top:3px'>
+                            {kw.suggestions[0] if kw.suggestions else 'Add to Skills or Projects section'}
+                          </div>
+                        </div>""", unsafe_allow_html=True)
+
+            # Quick-add to CV builder
+            st.markdown("---")
+            st.markdown("**⚡ Quick action:**")
+            c1, c2 = st.columns(2)
+            with c1:
+                top_tech = [k.term for k in tech_kws[:5]]
+                if top_tech and st.button(f"➕ Add top keywords to CV Builder", use_container_width=True):
+                    # Store top missing keywords for CV builder to pick up
+                    st.session_state['pending_keywords'] = top_tech
+                    st.session_state.page = "builder"
+                    st.session_state.cv_prefilled = False
+                    st.rerun()
+            with c2:
+                if st.button("🚀 Go to CV Builder", use_container_width=True):
+                    st.session_state.page = "builder"
+                    st.rerun()
 
     # ── TAB 2: SECTION ANALYSIS ────────────────────────────────────────────
     with tab_sec:
@@ -629,15 +743,18 @@ if st.session_state.analysis_done and st.session_state.results:
                             else:
                                 with st.spinner(f"Rewriting {sc.section_name}..."):
                                     suggester = r['suggester']
+                                    # Extract clean role name from JD (first non-empty short line)
+                                    jd_lines = [l.strip() for l in r['job_desc'].split('\n') if l.strip()]
+                                    clean_role = next((l for l in jd_lines if len(l) < 60 and not l.startswith(('#','*','-'))), jd_lines[0] if jd_lines else 'ML Engineer')
                                     improved = suggester.generate_content_for_section(
                                         name,
                                         {
                                             'job_desc': r['job_desc'],
                                             'existing_resume': r['resume_text'],
-                                            'target_role': r['job_desc'][:100],
+                                            'section_content': sc.content if hasattr(sc, 'content') else '',
+                                            'target_role': clean_role,
                                             'candidate_mode': st.session_state.candidate_mode,
                                             'issues': '\n'.join(sc.improvement_areas),
-                                            'current_content': sc,
                                         }
                                     )
                                     st.session_state.fixed_sections[fix_result_key] = improved
@@ -704,56 +821,130 @@ if st.session_state.analysis_done and st.session_state.results:
 
     # ── TAB 4: GENERATE CONTENT ────────────────────────────────────────────
     with tab_gen:
-        if not GEMINI_KEY:
-            st.info("💡 Add GEMINI_API_KEY to .env for AI-generated content. Templates will be used otherwise.")
-
         st.markdown("**Generate or improve any resume section:**")
         st.markdown("<br>", unsafe_allow_html=True)
 
         miss_secs = r['completeness'].missing_sections
-        all_secs  = ['summary', 'skills', 'projects', 'certifications',
-                     'experience', 'contact']
+        all_secs  = ['summary', 'skills', 'projects', 'certifications', 'experience']
 
-        selected = st.selectbox(
-            "Section to generate",
-            options=all_secs,
-            format_func=lambda x: f"{'⚠️ ' if x in miss_secs else ''}{x.title()}"
-        )
-        target_role = st.text_input(
-            "Target role",
-            placeholder="e.g. ML Engineer, Data Scientist, Software Engineer"
-        )
+        col_sel, col_role = st.columns(2)
+        with col_sel:
+            selected = st.selectbox(
+                "Section to generate",
+                options=all_secs,
+                format_func=lambda x: f"{'⚠️ ' if x in miss_secs else '✏️ '}{x.title()}"
+            )
+        with col_role:
+            target_role = st.text_input("Target role", placeholder="ML Engineer Intern, Data Scientist...")
 
         _, btn_col, _ = st.columns([1, 1, 1])
         with btn_col:
             gen_clicked = st.button("✨ Generate", use_container_width=True)
 
         if gen_clicked and selected:
+            clean_role = target_role.strip() or "ML Engineer Intern"
             with st.spinner("Generating..."):
                 suggester = r['suggester']
-                generated = suggester.generate_content_for_section(
-                    selected,
-                    {
-                        'job_desc': r['job_desc'],
-                        'existing_resume': r['resume_text'],
-                        'target_role': target_role or selected,
-                        'candidate_mode': st.session_state.candidate_mode,
+                resume = r['resume_text']
+                jd = r['job_desc']
+                mode_str = st.session_state.candidate_mode
+
+                if suggester.model:
+                    prompts = {
+                        'summary': (
+                            f"Write an improved professional summary for this resume targeting: {clean_role}.\n\n"
+                            f"RESUME:\n{resume[:2000]}\n\n"
+                            f"Rules:\n"
+                            f"- 3-4 sentences, under 80 words\n"
+                            f"- Reference the candidate's REAL projects and actual skills\n"
+                            f"- Include 2-3 keywords from JD: {jd[:300]}\n"
+                            f"- No clichés (not 'passionate', 'results-driven')\n"
+                            f"- No placeholders like [Your University]\n"
+                            f"Return ONLY the summary paragraph."
+                        ),
+                        'skills': (
+                            f"Improve this resume's skills section for role: {clean_role}.\n\n"
+                            f"CURRENT RESUME:\n{resume[:2000]}\n\n"
+                            f"JOB DESCRIPTION:\n{jd[:600]}\n\n"
+                            f"Instructions:\n"
+                            f"1. Keep ALL existing skill categories and their items\n"
+                            f"2. ADD at least 3-5 missing JD keywords to the right categories\n"
+                            f"3. The result MUST contain more items than the original\n"
+                            f"Return ONLY lines in format: Category Name: item1, item2, item3"
+                        ),
+                        'projects': (
+                            f"REWRITE and IMPROVE the project descriptions from this resume for role: {clean_role}.\n\n"
+                            f"ORIGINAL PROJECTS:\n{resume[:2500]}\n\n"
+                            f"JD KEYWORDS TO INCORPORATE: {jd[:400]}\n\n"
+                            f"Requirements:\n"
+                            f"- Keep the SAME project names and tech stacks\n"
+                            f"- Rewrite EVERY bullet to be stronger — stronger verbs, more specific metrics\n"
+                            f"- Each bullet must start with an action verb\n"
+                            f"- Incorporate relevant JD keywords naturally\n"
+                            f"- Add a 'Key Achievement' line for each project if missing\n"
+                            f"- The output MUST differ significantly from the input\n\n"
+                            f"Format:\n"
+                            f"**ProjectName** | TechStack | DateRange\n"
+                            f"- Bullet 1 (action verb + metric + JD keyword)\n"
+                            f"- Bullet 2\n"
+                            f"- Bullet 3\n\n"
+                            f"Return ONLY the improved project entries."
+                        ),
+                        'certifications': (
+                            f"Recommend 4-5 specific, real certifications for someone targeting: {clean_role}.\n"
+                            f"JD context: {jd[:400]}\n\n"
+                            f"For each:\n"
+                            f"**Certification Name** | Platform | ~Duration\n"
+                            f"Why: one sentence on relevance\n\n"
+                            f"Focus on Google, Coursera/DeepLearning.AI, AWS, Kaggle.\n"
+                            f"Return ONLY the certification list."
+                        ),
+                        'experience': (
+                            f"Write 2 strong internship/project experience entries for a {mode_str} "
+                            f"targeting {clean_role}.\n"
+                            f"Resume context:\n{resume[:1500]}\n\n"
+                            f"Use this format:\n"
+                            f"**Role** | Company | Start – End\n"
+                            f"- Achievement bullet with metric\n"
+                            f"- Technical contribution bullet\n\n"
+                            f"Return ONLY the experience entries."
+                        ),
                     }
-                )
+                    prompt = prompts.get(selected, prompts['summary'])
+                    try:
+                        generated = suggester._call_model(prompt)
+                    except Exception as e:
+                        generated = f"❌ AI error: {e}"
+                else:
+                    # No AI — give a useful structured template, not raw resume dump
+                    generated = suggester.generate_content_for_section(
+                        selected, {
+                            'job_desc': jd, 'existing_resume': resume,
+                            'target_role': clean_role,
+                            'candidate_mode': st.session_state.candidate_mode
+                        }
+                    )
                 st.session_state.generated_sections[selected] = generated
 
         if selected in st.session_state.generated_sections:
             content = st.session_state.generated_sections[selected]
-            st.markdown(f"**Generated {selected.title()} Section:**")
-            st.markdown(f'<div class="generated-content">{content}</div>',
-                        unsafe_allow_html=True)
+            st.markdown(f"**✨ Improved {selected.title()} Section:**")
+            # Render with proper markdown formatting
+            st.markdown(content)
             st.markdown("<br>", unsafe_allow_html=True)
-            st.download_button(
-                f"⬇️ Download {selected.title()}",
-                data=content,
-                file_name=f"generated_{selected}.txt",
-                mime="text/plain"
-            )
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button(
+                    f"⬇️ Download as .txt",
+                    data=content,
+                    file_name=f"improved_{selected}.txt",
+                    mime="text/plain",
+                    use_container_width=True
+                )
+            with c2:
+                if st.button("🗑️ Clear", key=f"clear_gen_{selected}", use_container_width=True):
+                    del st.session_state.generated_sections[selected]
+                    st.rerun()
 
     # ── FULL REPORT DOWNLOAD ───────────────────────────────────────────────
     st.markdown('<div class="neon-divider"></div>', unsafe_allow_html=True)

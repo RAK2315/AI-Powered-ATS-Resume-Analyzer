@@ -23,9 +23,13 @@ class ScoreMetrics:
 class ScoreCalculator:
     """Computes ATS compatibility scores using TF-IDF cosine similarity."""
 
-    # Empirically determined thresholds for normalization
-    LOW_THRESHOLD = 0.08
-    HIGH_THRESHOLD = 0.45
+    # Calibrated thresholds — resumes naturally have lower similarity than docs
+    # Raw cosine similarity between resume & JD typically ranges 0.05–0.35
+    # 0.10 = decent match, 0.20 = good match, 0.30+ = strong match
+    LOW_THRESHOLD  = 0.05   # below this → below 40
+    MID_THRESHOLD  = 0.12   # around here → 50-60
+    HIGH_THRESHOLD = 0.22   # around here → 70-80
+    TOP_THRESHOLD  = 0.32   # above this → 85+
 
     def __init__(self):
         self.text_processor = TextProcessor()
@@ -52,14 +56,29 @@ class ScoreCalculator:
             return 0.0
 
     def normalize_score(self, similarity: float) -> int:
-        """Normalize raw similarity to 0-100 scale."""
+        """Normalize raw similarity to 0-100 scale using calibrated thresholds.
+        
+        Typical resume vs JD similarity: 0.05-0.35
+        A score of 0.10 is actually decent — old code wrongly gave this ~37/100.
+        """
         if similarity <= self.LOW_THRESHOLD:
-            normalized = (similarity / self.LOW_THRESHOLD) * 30
+            # 0 – 0.05  →  0 – 35
+            normalized = (similarity / self.LOW_THRESHOLD) * 35
+        elif similarity <= self.MID_THRESHOLD:
+            # 0.05 – 0.12  →  35 – 55
+            normalized = 35 + ((similarity - self.LOW_THRESHOLD) /
+                               (self.MID_THRESHOLD - self.LOW_THRESHOLD)) * 20
         elif similarity <= self.HIGH_THRESHOLD:
-            normalized = 30 + ((similarity - self.LOW_THRESHOLD) /
-                               (self.HIGH_THRESHOLD - self.LOW_THRESHOLD)) * 60
+            # 0.12 – 0.22  →  55 – 75
+            normalized = 55 + ((similarity - self.MID_THRESHOLD) /
+                               (self.HIGH_THRESHOLD - self.MID_THRESHOLD)) * 20
+        elif similarity <= self.TOP_THRESHOLD:
+            # 0.22 – 0.32  →  75 – 90
+            normalized = 75 + ((similarity - self.HIGH_THRESHOLD) /
+                               (self.TOP_THRESHOLD - self.HIGH_THRESHOLD)) * 15
         else:
-            normalized = 90 + min((similarity - self.HIGH_THRESHOLD) / 0.2 * 10, 10)
+            # > 0.32  →  90 – 100
+            normalized = 90 + min((similarity - self.TOP_THRESHOLD) / 0.1 * 10, 10)
 
         return min(100, max(0, int(round(normalized))))
 

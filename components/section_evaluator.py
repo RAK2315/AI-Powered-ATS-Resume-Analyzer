@@ -124,10 +124,41 @@ class SectionEvaluator:
         if not identified:
             identified = self._heuristic_detection(resume_text)
 
+        # Contact info: always check header lines (email/phone/linkedin in first 5 lines)
+        # regardless of whether a CONTACT section header exists
+        if 'contact' not in identified:
+            header_lines = resume_text.split('\n')[:6]
+            header_text = '\n'.join(header_lines)
+            has_contact = any(
+                re.search(pat, header_text, re.IGNORECASE)
+                for pat in [r'[\w.+-]+@[\w.-]+\.[a-z]{2,}',
+                            r'\+?\d[\d\s\-().]{7,15}\d',
+                            r'linkedin\.com',
+                            r'github\.com']
+            )
+            if has_contact:
+                identified['contact'] = Section('contact', header_text, 0, 6)
+
         return identified
 
     def _is_section_header(self, line: str, current_section: str) -> bool:
-        """Check if a line is a different section header."""
+        """Check if a line is a different section header.
+        
+        A true section header is:
+        - Short (< 45 chars)
+        - Does NOT contain a colon followed by content (e.g. "Skills: Python" is not a header)
+        - Does NOT contain typical sentence punctuation suggesting it's body text
+        """
+        # Skip obvious content lines
+        if len(line) > 45:
+            return False
+        # Skip lines with "word: content" pattern (skill categories, contact fields etc.)
+        if re.search(r'\w+\s*:\s*\w', line):
+            return False
+        # Skip lines that are clearly bullet content
+        if line.startswith(('•', '-', '*', '·')):
+            return False
+        
         for section_name, patterns in SECTION_PATTERNS.items():
             if section_name == current_section:
                 continue
