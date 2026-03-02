@@ -27,8 +27,7 @@ _AI_MODES = {
 }
 
 def _ai_btn(label, key, current_text, job_desc, mode, suggester):
-    if not current_text or len(current_text.strip()) < 5:
-        return
+    """AI rewrite button — always visible, shows appropriate error on click."""
     rkey = f"air_{key}"
     mkey = f"aim_{key}"
     c_sel, c_btn = st.columns([2, 1])
@@ -40,33 +39,122 @@ def _ai_btn(label, key, current_text, job_desc, mode, suggester):
         run = st.button("✨ Run AI", key=f"btn_{key}", use_container_width=True)
 
     if run:
-        if not suggester or not suggester.model:
-            st.warning("Add GEMINI_API_KEY to .env for AI features.")
+        # Check API key
+        no_ai = not suggester or not suggester.has_ai
+        if no_ai:
+            st.warning("⚠️ Add GEMINI_API_KEY or GROQ_API_KEY to .env to use AI features. Get Groq free at console.groq.com")
+            return
+        if not current_text or len(current_text.strip()) < 3:
+            st.warning("Add some content first, then use AI to improve it.")
+            return
+        role = ss('cv_target_role') or 'the target role'
+
+        # Detect section type for context-appropriate prompt
+        is_skills = 'skills' in key
+        is_edu    = 'edu_' in key
+
+        if is_skills:
+            instructions = {
+                "rewrite": f"Improve this skills section for {role}. Keep existing items, add 2-3 missing JD keywords.",
+                "expand":  f"Keep all existing skills AND add a new relevant category for {role} if warranted.",
+                "ats":     f"Add keywords from this JD that are missing: {job_desc[:300]}",
+                "concise": "Remove any redundant or weak items. Keep only the strongest per category.",
+            }
+        elif is_edu:
+            instructions = {
+                "rewrite": f"Write 1-2 concise sentences summarizing this education for {role}. Max 40 words.",
+                "expand":  f"Add 1 relevant coursework or achievement sentence for {role}. Factual only, 1 sentence.",
+                "ats":     f"Rewrite to include relevant keywords for {role}: {job_desc[:150]}",
+                "concise": "Shorten to degree, institution, and one key achievement only.",
+            }
         else:
-            role = ss('cv_target_role') or 'the target role'
             instructions = {
                 "rewrite": f"Rewrite and improve this content for a {role} role. Keep all real facts, names, metrics.",
-                "expand":  f"Keep existing content AND add exactly 2 strong new bullet points relevant to {role}. Base new bullets on the skills and context shown.",
+                "expand":  f"Keep existing content AND add exactly 2 strong new bullet points relevant to {role}.",
                 "ats":     f"Rewrite incorporating these ATS keywords naturally: {job_desc[:300]}",
                 "concise": "Make each bullet more concise — under 15 words. Preserve all key metrics.",
             }
-            with st.spinner(_AI_MODES[chosen] + "..."):
-                try:
+
+        with st.spinner(_AI_MODES[chosen] + "..."):
+            try:
+                if is_skills:
                     prompt = (
-                        f"You are an ATS resume expert.\n\nTASK: {instructions[chosen]}\n\n"
-                        f"CONTENT TO IMPROVE:\n{current_text}\n\n"
-                        f"RESUME CONTEXT: {ss('cv_summary') or 'ML/CS student with projects'}\n"
+                        f"You are a resume skills editor.\n\nTASK: {instructions[chosen]}\n\n"
+                        f"CURRENT SKILLS:\n{current_text}\n\n"
                         f"TARGET ROLE: {role}\n\n"
                         f"Rules:\n"
-                        f"- Return ONLY the improved content, no labels or explanation\n"
-                        f"- Keep real project names, metrics, tech stacks from original\n"
-                        f"- No placeholder text like [Your University] or [Add here]\n"
-                        f"- Each bullet starts with action verb, includes specific metric"
+                        f"- Return ONLY lines in format: Category: item1, item2, item3\n"
+                        f"- One category per line, no bullets, no sentences, no paragraphs\n"
+                        f"- Do NOT invent fake metrics or percentages\n"
+                        f"- Keep all existing categories intact"
                     )
-                    result = suggester._call_model(prompt)
-                    st.session_state[rkey] = result
-                except Exception as e:
-                    st.error(f"AI error: {e}")
+                elif is_edu:
+                    edu_instructions = {
+                        "rewrite": (
+                            f"Rewrite the Relevant Coursework for this education entry to be more impactful for {role}.\n"
+                            f"Keep it as a comma-separated list of course names. "
+                            f"Add 2-3 relevant courses from the JD if they are plausibly part of a CS degree. "
+                            f"Remove weak/generic ones. Return ONLY the improved coursework list, no label."
+                        ),
+                        "expand": (
+                            f"Add 2-3 more relevant courses to this coursework list for {role}: {current_text}\n"
+                            f"Return ONLY the full updated comma-separated coursework list."
+                        ),
+                        "ats": (
+                            f"Add JD-relevant coursework to this education for {role}. "
+                            f"JD context: {job_desc[:200]}\nReturn ONLY the updated coursework list."
+                        ),
+                        "concise": (
+                            f"Shorten to only the 5-6 most relevant courses for {role}: {current_text}\n"
+                            f"Return ONLY the shortened comma-separated list."
+                        ),
+                    }
+                    prompt = (
+                        f"You are a resume editor.\n\n"
+                        f"EDUCATION ENTRY:\n{current_text}\n\n"
+                        f"TARGET ROLE: {role}\n\n"
+                        f"TASK: {edu_instructions.get(chosen, edu_instructions['rewrite'])}\n\n"
+                        f"Rules:\n"
+                        f"- Use only real facts, no invented metrics\n"
+                        f"- Keep output SHORT and specific\n"
+                        f"- No extra explanation, no labels"
+                    )
+                else:
+                    is_summary = key == 'summary'
+                    if is_summary:
+                        prompt = (
+                            f"You are an ATS resume expert.\n\nTASK: {instructions[chosen]}\n\n"
+                            f"CURRENT SUMMARY:\n{current_text}\n\n"
+                            f"TARGET ROLE: {role}\n\n"
+                            f"Rules:\n"
+                            f"- Write as a flowing paragraph — ABSOLUTELY NO bullet points\n"
+                            f"- 2-3 sentences, under 60 words total\n"
+                            f"- Tone: if role has 'intern' or target looks like fresher role → start with "
+                            f"'CS/ML student with...' or 'Final-year student...'\n"
+                            f"- Use REAL facts from the current summary\n"
+                            f"- No clichés: not 'highly skilled', 'passionate', 'dynamic', 'results-driven'\n"
+                            f"- Return ONLY the paragraph, no label, no quotes"
+                        )
+                    else:
+                        prompt = (
+                            f"You are an ATS resume expert.\n\nTASK: {instructions[chosen]}\n\n"
+                            f"CONTENT TO IMPROVE:\n{current_text}\n\n"
+                            f"RESUME CONTEXT: {ss('cv_summary') or 'ML/CS student with projects'}\n"
+                            f"TARGET ROLE: {role}\n\n"
+                            f"Rules:\n"
+                            f"- Return ONLY improved bullet points, no extra explanation\n"
+                            f"- Keep real project names, real metrics from the original\n"
+                            f"- Do NOT invent fake metrics (no '40% improvement' unless in original)\n"
+                            f"- Each bullet starts with a strong action verb"
+                        )
+                result = suggester._call_model(prompt)
+                st.session_state[rkey] = result
+            except Exception as e:
+                err = str(e)
+                if 'quota' in err.lower() or '429' in err:
+                    st.error("⏳ Quota exceeded. Add GROQ_API_KEY to .env for unlimited free access (console.groq.com)")
+                else:
+                    st.error(f"AI error: {err[:200]}")
 
     if rkey in st.session_state:
         st.markdown(
@@ -302,7 +390,20 @@ def render_cv_builder(gemini_key: str = ""):
                 _live_key = ""
         except Exception:
             pass
-    suggester = AISuggester(api_key=_live_key or None)
+    # Also load Groq key for Llama fallback
+    _groq_key = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
+    _groq_bad = ("", "your_groq_key_here", "gsk_...")
+    if _groq_key in _groq_bad or len(_groq_key) < 20:
+        _groq_key = ""
+    if not _groq_key:
+        try:
+            import streamlit as _st2
+            _groq_key = _st2.secrets.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
+            if _groq_key in _groq_bad or len(_groq_key) < 20:
+                _groq_key = ""
+        except Exception:
+            pass
+    suggester = AISuggester(api_key=_live_key or None, groq_key=_groq_key or None)
 
     # session state defaults
     for k, v in [('cv_exp_count', 1), ('cv_proj_count', 2), ('cv_edu_count', 1),
@@ -320,6 +421,13 @@ def render_cv_builder(gemini_key: str = ""):
     resume_text = st.session_state['results']['resume_text'] if has_results else ""
     job_desc    = st.session_state['results']['job_desc']    if has_results else ""
     mode        = st.session_state.get('candidate_mode', '🎓 Student / Fresher')
+
+    # Apply pre-parsed data from "Implement All" button
+    impl_parsed = st.session_state.pop('_impl_parsed', None)
+    if impl_parsed:
+        from components.resume_extractor import ParsedResume
+        _init_from_resume(impl_parsed)
+        st.success("✅ Resume imported to CV Builder! Review and edit below.")
 
     # Apply pending keywords from "Quick Add" button on Keywords tab
     pending_kws = st.session_state.pop('pending_keywords', None)
@@ -493,7 +601,10 @@ def render_cv_builder(gemini_key: str = ""):
                     with dc2: st.text_input("End",   key=f"cv_pend_{i}",   placeholder="02/2025")
                 st.text_area("Description (one point per line)", key=f"cv_pbullets_{i}", height=90,
                              placeholder="Built REST API achieving 99.24% accuracy\nDeployed on Render with <3s latency")
-                _ai_btn(f"Proj {i+1}", f"proj_{i}", ss(f"cv_pbullets_{i}"), job_desc, mode, suggester)
+                # Pass the widget value directly from session_state (already set by text_area above)
+                _ai_btn(f"Proj {i+1}", f"proj_{i}",
+                        st.session_state.get(f"cv_pbullets_{i}", ""),
+                        job_desc, mode, suggester)
         _div()
 
         # ── SKILLS ────────────────────────────────────────────────────────────
@@ -566,6 +677,77 @@ def render_cv_builder(gemini_key: str = ""):
         _tip("One per line. Certs: Name | Platform | Year. Awards: full text.")
         st.text_area("Certifications", height=80, key="cv_certs", label_visibility="collapsed",
                      placeholder="ML Specialization | Coursera | 2025\n1st Runner-Up | India AI Impact Buildathon 2026")
+
+        # Certs AI button — special mode for formatting + suggesting
+        certs_text = st.session_state.get("cv_certs", "")
+        crkey = "air_certs"
+        c_sel, c_btn = st.columns([2, 1])
+        with c_sel:
+            cert_mode = st.selectbox("AI action", [
+                "format",    "suggest",   "rewrite"
+            ], format_func=lambda x: {
+                "format":  "🗂️ Clean up formatting",
+                "suggest": "💡 Suggest certs for my role",
+                "rewrite": "✨ Improve award descriptions",
+            }[x], key="aim_certs", label_visibility="collapsed")
+        with c_btn:
+            run_certs = st.button("✨ Run AI", key="btn_certs", use_container_width=True)
+
+        if run_certs:
+            if not suggester or not suggester.has_ai:
+                st.warning("Add GROQ_API_KEY to .env for AI features.")
+            else:
+                role = ss('cv_target_role') or 'ML Engineer'
+                cert_prompts = {
+                    "format": (
+                        f"Clean up and standardize the formatting of these certifications/awards:\n\n"
+                        f"{certs_text}\n\n"
+                        f"Rules:\n"
+                        f"- One entry per line\n"
+                        f"- Certs format: Certification Name | Platform | Year\n"
+                        f"- Awards format: Award Name | Organization | Date | Brief context (1 sentence)\n"
+                        f"- Detect where one entry ends and the next begins\n"
+                        f"- Fix any run-on text, capitalize properly\n"
+                        f"- Return ONLY the cleaned list, one entry per line"
+                    ),
+                    "suggest": (
+                        f"Suggest 4-5 real, obtainable certifications for someone targeting: {role}.\n"
+                        f"Existing certs: {certs_text[:300] or 'none'}\n\n"
+                        f"Format each as: Certification Name | Platform | ~Time to complete\n"
+                        f"Focus on: Google, Coursera/DeepLearning.AI, Kaggle, AWS, Hugging Face.\n"
+                        f"Return ONLY the list, one cert per line."
+                    ),
+                    "rewrite": (
+                        f"Improve the descriptions of these awards/certifications for a resume:\n\n"
+                        f"{certs_text}\n\n"
+                        f"Rules:\n"
+                        f"- Make award descriptions more impactful (mention scale, competition size)\n"
+                        f"- Certs: keep Name | Platform | Year format\n"
+                        f"- Keep all real facts, no invented details\n"
+                        f"- Return ONLY the improved list, one per line"
+                    ),
+                }
+                with st.spinner("Running AI on certifications..."):
+                    try:
+                        result = suggester._call_model(cert_prompts[cert_mode])
+                        st.session_state[crkey] = result
+                    except Exception as e:
+                        st.error(f"AI error: {str(e)[:200]}")
+
+        if crkey in st.session_state:
+            st.markdown(
+                f"<div style='background:#0d1a2a;border:1px solid #1a3050;border-left:3px solid #00d4ff;"
+                f"border-radius:8px;padding:0.8rem;font-family:Space Mono,monospace;font-size:0.8rem;"
+                f"line-height:1.8;color:#a0c8e0;white-space:pre-wrap;margin:0.4rem 0'>"
+                f"{st.session_state[crkey]}</div>", unsafe_allow_html=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("⬇️ Copy", data=st.session_state[crkey],
+                                   file_name="certs.txt", mime="text/plain",
+                                   key="dl_certs", use_container_width=True)
+            with c2:
+                if st.button("✕ Dismiss", key="dis_certs", use_container_width=True):
+                    del st.session_state[crkey]; st.rerun()
         _div()
 
         # ── GENERATE ──────────────────────────────────────────────────────────

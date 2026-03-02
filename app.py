@@ -32,16 +32,28 @@ st.set_page_config(
 )
 
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip('"').strip("'")
-# Reject placeholder values
-_PLACEHOLDERS = ("", "your_key_here", "AIza...", "your-key-here", "your_api_key_here")
+_PLACEHOLDERS = ("", "your_key_here", "AIza...", "your-key-here", "your_api_key_here",
+                  "gsk_...", "your_groq_key_here")
 if GEMINI_KEY in _PLACEHOLDERS or len(GEMINI_KEY) < 20:
     GEMINI_KEY = ""
-# Also try Streamlit secrets (for Streamlit Cloud deployment)
+# Also try Streamlit secrets
 if not GEMINI_KEY:
     try:
         GEMINI_KEY = st.secrets.get("GEMINI_API_KEY", "").strip().strip('"').strip("'")
         if GEMINI_KEY in _PLACEHOLDERS or len(GEMINI_KEY) < 20:
             GEMINI_KEY = ""
+    except Exception:
+        pass
+
+# Groq API key (Llama 3.3 — free fallback when Gemini quota exhausted)
+GROQ_KEY = os.getenv("GROQ_API_KEY", "").strip().strip('"').strip("'")
+if GROQ_KEY in _PLACEHOLDERS or len(GROQ_KEY) < 20:
+    GROQ_KEY = ""
+if not GROQ_KEY:
+    try:
+        GROQ_KEY = st.secrets.get("GROQ_API_KEY", "").strip().strip('"').strip("'")
+        if GROQ_KEY in _PLACEHOLDERS or len(GROQ_KEY) < 20:
+            GROQ_KEY = ""
     except Exception:
         pass
 
@@ -58,7 +70,7 @@ html, body, [class*="css"] {
     color: #e8e8f0;
 }
 .stApp { background: linear-gradient(135deg,#0a0a0f 0%,#0f0f1a 50%,#0a0a0f 100%); }
-#MainMenu, footer, header { visibility: hidden; }
+#MainMenu, footer { visibility: hidden; }
 .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
 
 [data-testid="stSidebar"] {
@@ -123,9 +135,10 @@ html, body, [class*="css"] {
     pointer-events: none;
 }
 .score-number { font-size: 4.5rem; font-weight: 800; font-family: 'Space Mono', monospace; line-height: 1; }
-.score-high { color: #00ff88; }
-.score-mid  { color: #ffb800; }
-.score-low  { color: #ff4444; }
+.score-high   { color: #00ff88; }
+.score-mid    { color: #ffb800; }
+.score-orange { color: #ff8c00; }
+.score-low    { color: #ff4444; }
 .score-label { color: #a0a0c8; font-size: 0.95rem; font-weight: 600; margin-top: 0.4rem; }
 
 .metric-card {
@@ -306,18 +319,25 @@ with st.sidebar:
     )
     st.session_state.candidate_mode = mode
 
-    if not GEMINI_KEY:
+    # Debug status — printed to terminal, not shown in UI
+    _ai_parts = []
+    if GROQ_KEY:   _ai_parts.append("Groq✓")
+    if GEMINI_KEY: _ai_parts.append("Gemini✓")
+    if not _ai_parts: _ai_parts.append("NO AI KEYS")
+    print(f"[ATS] AI status: {' | '.join(_ai_parts)}")
+
+    if not GROQ_KEY and not GEMINI_KEY:
         st.markdown("---")
         st.markdown("""
         <div style='background:rgba(255,184,0,0.08);border:1px solid rgba(255,184,0,0.2);
                     border-radius:8px;padding:0.8rem;font-size:0.78rem;color:#c8a000'>
-            ⚠️ <b>Gemini AI not connected.</b><br><br>
-            <b>Locally:</b> Open <code>.env</code> and set:<br>
-            <code>GEMINI_API_KEY=AIzaSy...</code><br><br>
-            <b>Streamlit Cloud:</b> App Settings → Secrets → add:<br>
-            <code>GEMINI_API_KEY = "AIzaSy..."</code><br><br>
-            <a href='https://aistudio.google.com' target='_blank' style='color:#c8a000'>
-            Get free key at aistudio.google.com →</a>
+            ⚠️ <b>No AI connected.</b><br><br>
+            <b>Groq (recommended, free):</b><br>
+            <code>GROQ_API_KEY=gsk_...</code><br>
+            <a href='https://console.groq.com' target='_blank' style='color:#c8a000'>console.groq.com →</a><br><br>
+            <b>Gemini (Google, free):</b><br>
+            <code>GEMINI_API_KEY=AIzaSy...</code><br>
+            <a href='https://aistudio.google.com' target='_blank' style='color:#c8a000'>aistudio.google.com →</a>
         </div>
         """, unsafe_allow_html=True)
 
@@ -442,15 +462,16 @@ if analyze_clicked:
                 for sc in section_scores.values():
                     all_improvements.extend(sc.improvement_areas)
 
-                suggester = AISuggester(api_key=GEMINI_KEY or None)
+                suggester = AISuggester(api_key=GEMINI_KEY or None, groq_key=GROQ_KEY or None)
 
                 # ── Ask Gemini for holistic ATS score (more accurate than TF-IDF alone) ──
                 ai_score = None
+                ai_eligibility = []
                 if suggester.model:
                     try:
                         score_prompt = (
                             f"You are an ATS (Applicant Tracking System) expert.\n\n"
-                            f"Rate how well this resume matches the job description on a scale of 0-100.\n\n"
+                            f"Analyze this resume against the job description.\n\n"
                             f"RESUME:\n{resume_text[:2000]}\n\n"
                             f"JOB DESCRIPTION:\n{job_desc[:1200]}\n\n"
                             f"Candidate type: {mode}\n\n"
@@ -459,9 +480,14 @@ if analyze_clicked:
                             f"- 50-69: Decent match, some gaps but promising\n"
                             f"- 30-49: Partial match, missing several key requirements\n"
                             f"- 0-29: Poor match, major gaps\n\n"
-                            f"For students/freshers: judge based on projects, skills, and potential — "
-                            f"NOT on missing work experience.\n\n"
-                            f"Return ONLY a JSON object: {{\"score\": <number>, \"reasoning\": \"<1 sentence>\"}}"
+                            f"For students/freshers: judge on projects, skills, and potential — NOT on missing work experience.\n\n"
+                            f"Also check for hard eligibility blockers:\n"
+                            f"- Does the JD require a completed degree but resume shows student still enrolled?\n"
+                            f"- Does the JD require X years of experience the candidate clearly lacks?\n"
+                            f"- Any other hard requirements (citizenship, clearance, etc.) that may be unmet?\n\n"
+                            f"Return ONLY a JSON object:\n"
+                            f"{{\"score\": <number>, \"reasoning\": \"<1 sentence on skills match>\", "
+                            f"\"eligibility_warnings\": [\"<warning1>\", \"<warning2>\"] or []}}"
                         )
                         raw_score_resp = suggester._call_model(score_prompt)
                         import json, re as _re
@@ -475,7 +501,8 @@ if analyze_clicked:
                             raw = json_match.group(0)
                         parsed_score = json.loads(raw)
                         ai_score = max(0, min(100, int(float(str(parsed_score['score'])))))
-                        ai_reasoning = str(parsed_score.get('reasoning', ''))[:200]
+                        ai_reasoning = str(parsed_score.get('reasoning', ''))
+                        ai_eligibility = [str(w) for w in parsed_score.get('eligibility_warnings', []) if w]
                         # Blend: 60% AI + 40% TF-IDF for stability
                         blended = int(0.6 * ai_score + 0.4 * metrics.normalized_score)
                         from components.score_calculator import ScoreMetrics
@@ -489,6 +516,7 @@ if analyze_clicked:
                     except Exception:
                         ai_score = None
                         ai_reasoning = ''
+                        ai_eligibility = []
 
                 suggestions = suggester.generate_suggestions({
                     'score': metrics.normalized_score,
@@ -507,6 +535,7 @@ if analyze_clicked:
                     'section_scores': section_scores, 'completeness': completeness,
                     'suggestions': suggestions, 'suggester': suggester,
                     'ai_score': ai_score, 'ai_reasoning': ai_reasoning if ai_score else '',
+                    'ai_eligibility': ai_eligibility if ai_score else [],
                 }
                 st.session_state.analysis_done = True
                 st.session_state.fixed_sections = {}
@@ -544,7 +573,18 @@ if st.session_state.analysis_done and st.session_state.results:
         if st.button("🚀 Implement All in CV Builder", use_container_width=True,
                      key="implement_all_btn",
                      help="Jump to CV Builder — auto-fills from your resume with AI improvements"):
-            st.session_state.cv_prefilled = False  # force re-parse prompt
+            # Auto-parse resume now so cv_builder opens already filled
+            from components.resume_extractor import extract_resume_structure
+            from components.ai_suggester import AISuggester as _AI
+            _s = _AI(api_key=GEMINI_KEY or None, groq_key=GROQ_KEY or None)
+            try:
+                from components.resume_extractor import ParsedResume
+                _parsed = extract_resume_structure(r['resume_text'], _s.model or _s.groq)
+                # Store parsed data so cv_builder can load it directly
+                st.session_state['_impl_parsed'] = _parsed
+            except Exception:
+                st.session_state['_impl_parsed'] = None
+            st.session_state.cv_prefilled = True   # skip the "detected" banner
             st.session_state.page = "builder"
             st.rerun()
 
@@ -552,13 +592,22 @@ if st.session_state.analysis_done and st.session_state.results:
     col_score, col_metrics = st.columns([1, 2], gap="large")
 
     with col_score:
-        sc_cls = "score-high" if score >= 70 else "score-mid" if score >= 45 else "score-low"
-        emoji  = "🟢" if score >= 70 else "🟡" if score >= 45 else "🔴"
-        ctx = ("Strong match! Minor tweaks will make it excellent." if score >= 70
-               else "Good foundation — add missing keywords to improve." if score >= 45
+        sc_cls = "score-high" if score >= 80 else "score-mid" if score >= 60 else "score-orange" if score >= 40 else "score-low"
+        emoji  = "🟢" if score >= 80 else "🟡" if score >= 60 else "🟠" if score >= 40 else "🔴"
+        ctx = ("Excellent match! Minor tweaks will make it perfect." if score >= 80
+               else "Good match — a few keyword gaps to close." if score >= 60
+               else "Moderate match — add missing keywords to improve." if score >= 40
                else "Needs work — see suggestions below to boost score.")
         score_method = f"<div style='font-size:0.68rem;color:#5a5a7a;margin-top:0.3rem'>{'🤖 AI-enhanced score' if ai_score else '📐 TF-IDF score'}</div>"
-        ai_note = f"<div style='font-size:0.75rem;color:#9090c8;margin-top:0.5rem;font-style:italic'>\"{ai_reasoning}\"</div>" if ai_reasoning else ""
+        if ai_reasoning:
+            # Truncate cleanly at sentence boundary, max ~180 chars
+            disp = ai_reasoning
+            if len(disp) > 180:
+                cut = disp[:180].rfind('.')
+                disp = disp[:cut+1] if cut > 80 else disp[:180] + '…'
+            ai_note = f"<div style='font-size:0.73rem;color:#9090c8;margin-top:0.5rem;font-style:italic;line-height:1.4'>{disp}</div>"
+        else:
+            ai_note = ""
         st.markdown(f"""
         <div class="score-card">
           <div style='font-size:0.7rem;color:#9090c0;letter-spacing:0.18em;
@@ -596,8 +645,22 @@ if st.session_state.analysis_done and st.session_state.results:
             {_mcol(sec_cnt,       "Sections Found","#b060ff")}
         </div>""", unsafe_allow_html=True)
 
+        # Eligibility warnings from AI
+        elig_warns = r.get('ai_eligibility', [])
+        for w in elig_warns:
+            st.markdown(f"""
+            <div style='background:rgba(255,60,0,0.12);border:1px solid rgba(255,100,0,0.4);
+                        border-left:4px solid #ff5500;border-radius:8px;
+                        padding:0.6rem 0.9rem;margin-bottom:0.5rem;font-size:0.85rem'>
+                🚨 <b style='color:#ff7744'>Eligibility Notice:</b>
+                <span style='color:#ffccaa'> {w}</span>
+            </div>""", unsafe_allow_html=True)
+
         # Missing sections — more visible
         for ms in r['completeness'].missing_sections:
+            # Skip experience warning for students/freshers
+            if ms == 'experience' and ('Student' in mode or 'Fresher' in mode or 'Intern' in mode):
+                continue
             st.markdown(f"""
             <div style='background:rgba(255,68,68,0.1);border:1px solid rgba(255,68,68,0.3);
                         border-radius:8px;padding:0.4rem 0.8rem;margin-bottom:0.4rem;font-size:0.85rem'>
@@ -852,15 +915,20 @@ if st.session_state.analysis_done and st.session_state.results:
                 if suggester.model:
                     prompts = {
                         'summary': (
-                            f"Write an improved professional summary for this resume targeting: {clean_role}.\n\n"
+                            f"Write a professional summary for this resume targeting: {clean_role}.\n\n"
                             f"RESUME:\n{resume[:2000]}\n\n"
+                            f"Candidate mode: {mode_str}\n\n"
                             f"Rules:\n"
-                            f"- 3-4 sentences, under 80 words\n"
-                            f"- Reference the candidate's REAL projects and actual skills\n"
+                            f"- 2-3 sentences only, under 60 words, NO bullet points\n"
+                            f"- Match the tone to the candidate level:\n"
+                            f"  * Student/Fresher/Intern → 'CS student with X experience, seeking Y'\n"
+                            f"  * Professional → 'X years of experience in Y, achieved Z'\n"
+                            f"- Reference REAL projects and actual skills from the resume\n"
                             f"- Include 2-3 keywords from JD: {jd[:300]}\n"
-                            f"- No clichés (not 'passionate', 'results-driven')\n"
+                            f"- No clichés: not 'highly skilled', 'passionate', 'results-driven', 'dynamic'\n"
+                            f"- No bullet points — write as a flowing paragraph\n"
                             f"- No placeholders like [Your University]\n"
-                            f"Return ONLY the summary paragraph."
+                            f"Return ONLY the summary paragraph, no label, no quotes."
                         ),
                         'skills': (
                             f"Improve this resume's skills section for role: {clean_role}.\n\n"
@@ -870,7 +938,11 @@ if st.session_state.analysis_done and st.session_state.results:
                             f"1. Keep ALL existing skill categories and their items\n"
                             f"2. ADD at least 3-5 missing JD keywords to the right categories\n"
                             f"3. The result MUST contain more items than the original\n"
-                            f"Return ONLY lines in format: Category Name: item1, item2, item3"
+                            f"4. Do NOT add skills the candidate clearly does not have\n"
+                            f"CRITICAL FORMAT: Return ONLY lines exactly like this, one per line:\n"
+                            f"Programming Languages: Python, C, C++\n"
+                            f"AI & ML: Supervised Learning, Feature Engineering\n"
+                            f"NO bullet points, NO sentences, NO explanations, NO blank lines between categories."
                         ),
                         'projects': (
                             f"REWRITE and IMPROVE the project descriptions from this resume for role: {clean_role}.\n\n"

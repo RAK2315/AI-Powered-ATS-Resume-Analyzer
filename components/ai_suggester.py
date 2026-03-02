@@ -1,6 +1,6 @@
 """
 AI Suggester Component
-Generates improvement recommendations using Google Gemini (free tier).
+Generates improvement recommendations using Gemini or Groq (Llama) as fallback.
 """
 
 import time
@@ -12,6 +12,12 @@ try:
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
+
+try:
+    from groq import Groq as GroqClient
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 
 @dataclass
@@ -31,28 +37,82 @@ class PrioritizedSuggestion:
     implementation_difficulty: str
 
 
-FALLBACK_SUGGESTIONS = [
-    PrioritizedSuggestion(
-        suggestion="Add quantifiable achievements to your experience bullets (e.g., 'Improved API response time by 40%').",
-        priority=1, category="experience", impact_estimate="High", implementation_difficulty="Medium"
-    ),
-    PrioritizedSuggestion(
-        suggestion="Tailor your skills section to match the exact keywords used in the job description.",
-        priority=1, category="keywords", impact_estimate="High", implementation_difficulty="Low"
-    ),
-    PrioritizedSuggestion(
-        suggestion="Add a 2-3 sentence professional summary at the top that mirrors the job requirements.",
-        priority=2, category="structure", impact_estimate="High", implementation_difficulty="Low"
-    ),
-    PrioritizedSuggestion(
-        suggestion="Use action verbs at the start of every bullet point (e.g., Developed, Led, Implemented, Designed).",
-        priority=2, category="language", impact_estimate="Medium", implementation_difficulty="Low"
-    ),
-    PrioritizedSuggestion(
-        suggestion="Ensure your resume is in a clean, ATS-friendly format — avoid tables, columns, and graphics.",
-        priority=3, category="format", impact_estimate="Medium", implementation_difficulty="Low"
-    ),
-]
+def _build_smart_suggestions(ctx: dict) -> list:
+    """Build resume-specific suggestions without AI, based on actual analysis data."""
+    score            = ctx.get('score', 50)
+    missing_keywords = ctx.get('missing_keywords', [])
+    missing_sections = ctx.get('missing_sections', [])
+    section_improv   = ctx.get('section_improvements', [])
+    job_desc         = ctx.get('job_desc', '')
+    candidate_mode   = ctx.get('candidate_mode', '')
+    is_fresher       = 'Student' in candidate_mode or 'Fresher' in candidate_mode or 'Intern' in candidate_mode
+
+    suggestions = []
+
+    # 1. Missing keywords — most impactful
+    if missing_keywords:
+        top_kws = ', '.join(f'"{k}"' for k in missing_keywords[:5])
+        suggestions.append(PrioritizedSuggestion(
+            suggestion=f"Add these high-priority keywords to your Skills or Projects section: {top_kws}. These appear in the JD but not in your resume.",
+            priority=1, category="keywords", impact_estimate="High", implementation_difficulty="Low"
+        ))
+
+    # 2. Missing sections
+    if 'summary' in missing_sections:
+        suggestions.append(PrioritizedSuggestion(
+            suggestion="Add a 3-4 sentence Professional Summary tailored to this role. It's the first thing ATS systems and recruiters read.",
+            priority=1, category="structure", impact_estimate="High", implementation_difficulty="Low"
+        ))
+    if 'experience' in missing_sections and not is_fresher:
+        suggestions.append(PrioritizedSuggestion(
+            suggestion="Add a Work Experience section. Even internships, freelance work, or part-time roles count.",
+            priority=1, category="structure", impact_estimate="High", implementation_difficulty="Medium"
+        ))
+
+    # 3. Score-based advice
+    if score < 50:
+        suggestions.append(PrioritizedSuggestion(
+            suggestion=f"Your keyword match is low ({score}/100). Mirror the exact phrasing from the JD — ATS systems do exact-match. Try copying 3-4 job requirement phrases directly into your Skills section.",
+            priority=1, category="keywords", impact_estimate="High", implementation_difficulty="Low"
+        ))
+    elif score < 65:
+        suggestions.append(PrioritizedSuggestion(
+            suggestion=f"Good foundation ({score}/100). Focus on adding the missing technical keywords above to your Projects bullets — this is the fastest way to improve your score.",
+            priority=2, category="keywords", impact_estimate="High", implementation_difficulty="Low"
+        ))
+
+    # 4. Fresher-specific advice
+    if is_fresher:
+        suggestions.append(PrioritizedSuggestion(
+            suggestion="For freshers: quantify every project metric you have. Format: 'Achieved X% accuracy on N samples using Y'. Numbers dramatically increase ATS and recruiter attention.",
+            priority=2, category="experience", impact_estimate="High", implementation_difficulty="Low"
+        ))
+    else:
+        suggestions.append(PrioritizedSuggestion(
+            suggestion="Start every bullet with a strong action verb and include a measurable outcome (%, $, time saved, scale). Example: 'Reduced inference latency by 40% using model quantization'.",
+            priority=2, category="language", impact_estimate="Medium", implementation_difficulty="Low"
+        ))
+
+    # 5. Section-specific improvements from evaluator
+    if section_improv:
+        unique = list(dict.fromkeys(section_improv))[:2]  # deduplicate
+        for imp in unique:
+            suggestions.append(PrioritizedSuggestion(
+                suggestion=imp,
+                priority=3, category="content", impact_estimate="Medium", implementation_difficulty="Low"
+            ))
+
+    # 6. Always-useful final tip
+    if missing_keywords and len(missing_keywords) > 5:
+        suggestions.append(PrioritizedSuggestion(
+            suggestion=f"You have {len(missing_keywords)} missing keywords. Don't add them all at once — focus on the top 5 technical ones. Adding skills you don't have will hurt you in interviews.",
+            priority=3, category="strategy", impact_estimate="Medium", implementation_difficulty="Low"
+        ))
+
+    return suggestions[:7]  # cap at 7
+
+
+FALLBACK_SUGGESTIONS = _build_smart_suggestions({})  # empty fallback for import safety
 
 
 class AISuggester:
@@ -61,26 +121,27 @@ class AISuggester:
     MAX_RETRIES = 3
     RETRY_DELAY = 2
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key
-        self.model = None
+    def __init__(self, api_key: Optional[str] = None, groq_key: Optional[str] = None):
+        self.api_key  = api_key
+        self.groq_key = groq_key
+        self.model    = None   # Gemini model
+        self.groq     = None   # Groq client
+
+        # Init Gemini
         if api_key and GEMINI_AVAILABLE:
             try:
                 genai.configure(api_key=api_key)
-                # Try to find available model via list_models, fallback to known names
-                model_name = 'gemini-2.0-flash'
+                model_name = 'gemini-1.5-flash'
                 try:
                     available = [m.name for m in genai.list_models()
                                  if 'generateContent' in m.supported_generation_methods]
-                    # Prefer 1.5-flash — better free tier quota than 2.0-flash
                     preferred = [
-                        'models/gemini-1.5-flash', 
+                        'models/gemini-1.5-flash',
                         'models/gemini-1.5-flash-latest',
                         'models/gemini-1.5-flash-8b',
                         'models/gemini-2.0-flash-lite',
                         'models/gemini-2.0-flash',
                         'models/gemini-1.5-pro-latest',
-                        'models/gemini-pro',
                     ]
                     for pref in preferred:
                         if pref in available:
@@ -92,38 +153,77 @@ class AISuggester:
             except Exception:
                 self.model = None
 
-    def _call_model(self, prompt: str, max_retries: int = 2) -> str:
-        """Call Gemini with retry on 429 quota errors, fallback to shorter prompt."""
-        import time
-        for attempt in range(max_retries + 1):
+        # Init Groq (Llama fallback)
+        if groq_key and GROQ_AVAILABLE:
             try:
-                resp = self.model.generate_content(prompt)
-                return resp.text.strip()
+                self.groq = GroqClient(api_key=groq_key)
+            except Exception:
+                self.groq = None
+
+    @property
+    def has_ai(self) -> bool:
+        return self.model is not None or self.groq is not None
+
+    def _call_groq(self, prompt: str) -> str:
+        """Call Groq (Llama 3.3) — fast, generous free tier."""
+        resp = self.groq.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1024,
+            temperature=0.7,
+        )
+        return resp.choices[0].message.content.strip()
+
+    def _call_model(self, prompt: str, max_retries: int = 1) -> str:
+        """Call Groq (primary) first, fall back to Gemini if Groq unavailable."""
+        # PRIMARY: Try Groq first (better free tier, faster, no daily cap issues)
+        if self.groq:
+            try:
+                return self._call_groq(prompt)
             except Exception as e:
-                err_str = str(e)
-                if '429' in err_str or 'quota' in err_str.lower():
-                    if attempt < max_retries:
-                        wait = 5 * (attempt + 1)  # 5s, 10s
-                        time.sleep(wait)
-                        # On retry, shorten the prompt to reduce token usage
-                        if len(prompt) > 1500:
-                            prompt = prompt[:1500] + '\n\nReturn ONLY the result, brief and concise.'
-                        continue
-                    else:
-                        raise Exception("API quota exceeded. Please wait a minute and try again.")
-                raise  # re-raise non-quota errors immediately
+                err = str(e)
+                if '429' in err or 'rate' in err.lower():
+                    # Groq rate limit — try Gemini before giving up
+                    pass
+                else:
+                    raise Exception(f"Groq error: {err[:150]}")
+
+        # FALLBACK: Gemini
+        if self.model:
+            for attempt in range(max_retries + 1):
+                try:
+                    resp = self.model.generate_content(prompt)
+                    return resp.text.strip()
+                except Exception as e:
+                    err_str = str(e)
+                    is_quota = '429' in err_str or 'quota' in err_str.lower()
+                    if is_quota:
+                        if attempt < max_retries:
+                            time.sleep(8)
+                            if len(prompt) > 1500:
+                                prompt = prompt[:1500] + '\n\nBe concise. Return ONLY the result.'
+                            continue
+                        raise Exception(
+                            "Both Groq and Gemini quota exceeded. "
+                            "Groq resets in ~1 min, Gemini resets daily."
+                        )
+                    raise
+
+        raise Exception(
+            "No AI connected. Add GROQ_API_KEY to .env (free at console.groq.com)."
+        )
 
     def generate_suggestions(self, analysis_context: dict) -> List[PrioritizedSuggestion]:
         """Generate improvement suggestions based on analysis results."""
-        if not self.model:
-            return FALLBACK_SUGGESTIONS
+        if not self.has_ai:
+            return _build_smart_suggestions(analysis_context)
 
         prompt = self._build_prompt(analysis_context)
 
         for attempt in range(self.MAX_RETRIES):
             try:
-                response = self.model.generate_content(prompt)
-                suggestions = self._parse_suggestions(response.text)
+                raw = self._call_model(prompt)
+                suggestions = self._parse_suggestions(raw)
                 if suggestions:
                     return suggestions
             except Exception as e:
@@ -131,7 +231,7 @@ class AISuggester:
                     time.sleep(self.RETRY_DELAY * (attempt + 1))
                 continue
 
-        return FALLBACK_SUGGESTIONS
+        return _build_smart_suggestions(analysis_context)
 
     def generate_content_for_section(self, section_type: str, context: dict) -> str:
         """Generate content for a missing resume section."""
