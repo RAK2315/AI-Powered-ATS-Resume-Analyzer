@@ -403,9 +403,52 @@ def render_cv_builder(gemini_key: str = ""):
                 _groq_key = ""
         except Exception:
             pass
-    suggester = AISuggester(api_key=_live_key or None, groq_key=_groq_key or None)
 
-    # session state defaults
+    # AWS Bedrock keys
+    _aws_access = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+    _aws_secret = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+    _aws_region = os.getenv("AWS_DEFAULT_REGION", "us-east-1").strip()
+    if len(_aws_access) < 16 or len(_aws_secret) < 20:
+        _aws_access = ""
+        _aws_secret = ""
+    if not _aws_access:
+        try:
+            import streamlit as _st3
+            _aws_access = _st3.secrets.get("AWS_ACCESS_KEY_ID", "").strip()
+            _aws_secret = _st3.secrets.get("AWS_SECRET_ACCESS_KEY", "").strip()
+            if len(_aws_access) < 16:
+                _aws_access = ""
+                _aws_secret = ""
+        except Exception:
+            pass
+
+    suggester = AISuggester(
+        api_key=_live_key or None,
+        groq_key=_groq_key or None,
+        aws_access_key=_aws_access or None,
+        aws_secret_key=_aws_secret or None,
+        aws_region=_aws_region,
+    )
+
+    has_results = st.session_state.get('results') is not None
+    resume_text = st.session_state['results']['resume_text'] if has_results else ""
+    job_desc    = st.session_state['results']['job_desc']    if has_results else ""
+    mode        = st.session_state.get('candidate_mode', '🎓 Student / Fresher')
+
+    # ── Detect resume change: wipe stale CV state if resume fingerprint changed ──
+    # This prevents a previous person's name/skills/data from showing up
+    _resume_fp = hash(resume_text[:200]) if resume_text else 0
+    _stored_fp = st.session_state.get('_cv_resume_fp', None)
+    if _stored_fp != _resume_fp:
+        # Resume changed (or first load) — clear all cv_ keys so we start fresh
+        stale = [k for k in list(st.session_state.keys())
+                 if k.startswith('cv_') and k not in ('cv_preview_dark', 'cv_target_role')]
+        for k in stale:
+            del st.session_state[k]
+        st.session_state['_cv_resume_fp'] = _resume_fp
+        st.session_state['cv_prefilled'] = False
+
+    # session state defaults — only set if missing (after the wipe above)
     for k, v in [('cv_exp_count', 1), ('cv_proj_count', 2), ('cv_edu_count', 1),
                  ('cv_pdf_bytes', None), ('cv_pdf_name', ''),
                  ('cv_prefilled', False), ('cv_target_role', ''),
@@ -414,13 +457,7 @@ def render_cv_builder(gemini_key: str = ""):
             st.session_state[k] = v
 
     if 'cv_skill_rows' not in st.session_state:
-        # Start blank — auto-fill will populate from resume if user uploads one
-        st.session_state.cv_skill_rows = []
-
-    has_results = st.session_state.get('results') is not None
-    resume_text = st.session_state['results']['resume_text'] if has_results else ""
-    job_desc    = st.session_state['results']['job_desc']    if has_results else ""
-    mode        = st.session_state.get('candidate_mode', '🎓 Student / Fresher')
+        st.session_state.cv_skill_rows = []  # always blank until auto-filled
 
     # Apply pre-parsed data from "Implement All" button
     impl_parsed = st.session_state.pop('_impl_parsed', None)

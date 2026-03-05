@@ -57,6 +57,23 @@ if not GROQ_KEY:
     except Exception:
         pass
 
+# AWS Bedrock keys (primary AI — uses hackathon credits)
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+AWS_REGION     = os.getenv("AWS_DEFAULT_REGION", "us-east-1").strip()
+if len(AWS_ACCESS_KEY) < 16 or len(AWS_SECRET_KEY) < 20:
+    AWS_ACCESS_KEY = ""
+    AWS_SECRET_KEY = ""
+if not AWS_ACCESS_KEY:
+    try:
+        AWS_ACCESS_KEY = st.secrets.get("AWS_ACCESS_KEY_ID", "").strip()
+        AWS_SECRET_KEY = st.secrets.get("AWS_SECRET_ACCESS_KEY", "").strip()
+        if len(AWS_ACCESS_KEY) < 16:
+            AWS_ACCESS_KEY = ""
+            AWS_SECRET_KEY = ""
+    except Exception:
+        pass
+
 # ─────────────────────────────────────────────────────────
 # GLOBAL CSS
 # ─────────────────────────────────────────────────────────
@@ -319,25 +336,41 @@ with st.sidebar:
     )
     st.session_state.candidate_mode = mode
 
-    # Debug status — printed to terminal, not shown in UI
-    _ai_parts = []
-    if GROQ_KEY:   _ai_parts.append("Groq✓")
-    if GEMINI_KEY: _ai_parts.append("Gemini✓")
-    if not _ai_parts: _ai_parts.append("NO AI KEYS")
-    print(f"[ATS] AI status: {' | '.join(_ai_parts)}")
+    # AI provider status — show in sidebar
+    st.markdown("---")
+    _providers = []
+    if AWS_ACCESS_KEY: _providers.append(("🟣 Bedrock", "#aa88ff", "Claude Haiku 4.5"))
+    if GROQ_KEY:       _providers.append(("🟢 Groq",    "#00cc66", "Llama 3.3 70B"))
+    if GEMINI_KEY:     _providers.append(("🔵 Gemini",  "#4488ff", "Gemini Flash"))
 
-    if not GROQ_KEY and not GEMINI_KEY:
-        st.markdown("---")
+    # Terminal debug
+    print(f"[ATS] AI status: {' | '.join(p[0] for p in _providers) or 'NO AI KEYS'}")
+
+    if _providers:
+        primary = _providers[0]
+        others  = _providers[1:]
+        badge_html = f"""
+        <div style='font-size:0.72rem;margin-bottom:0.3rem;color:#888'>🤖 AI Provider</div>
+        <div style='background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);
+                    border-radius:8px;padding:0.5rem 0.7rem;margin-bottom:0.3rem'>
+            <span style='color:{primary[1]};font-weight:700;font-size:0.8rem'>{primary[0]}</span>
+            <span style='color:#666;font-size:0.7rem'> · {primary[2]}</span>
+            <span style='float:right;font-size:0.65rem;color:#00aa44;background:rgba(0,170,68,0.1);
+                         padding:1px 6px;border-radius:4px'>ACTIVE</span>
+        </div>"""
+        if others:
+            badge_html += "<div style='font-size:0.68rem;color:#555;margin-top:0.2rem'>Fallback: "
+            badge_html += " → ".join(f"<span style='color:{c}'>{n.split()[1]}</span>"
+                                      for n, c, _ in others)
+            badge_html += "</div>"
+        st.markdown(badge_html, unsafe_allow_html=True)
+    else:
         st.markdown("""
         <div style='background:rgba(255,184,0,0.08);border:1px solid rgba(255,184,0,0.2);
                     border-radius:8px;padding:0.8rem;font-size:0.78rem;color:#c8a000'>
             ⚠️ <b>No AI connected.</b><br><br>
-            <b>Groq (recommended, free):</b><br>
-            <code>GROQ_API_KEY=gsk_...</code><br>
-            <a href='https://console.groq.com' target='_blank' style='color:#c8a000'>console.groq.com →</a><br><br>
-            <b>Gemini (Google, free):</b><br>
-            <code>GEMINI_API_KEY=AIzaSy...</code><br>
-            <a href='https://aistudio.google.com' target='_blank' style='color:#c8a000'>aistudio.google.com →</a>
+            <b>Groq (free):</b> <code>GROQ_API_KEY=gsk_...</code><br>
+            <a href='https://console.groq.com' target='_blank' style='color:#c8a000'>console.groq.com →</a>
         </div>
         """, unsafe_allow_html=True)
 
@@ -462,7 +495,13 @@ if analyze_clicked:
                 for sc in section_scores.values():
                     all_improvements.extend(sc.improvement_areas)
 
-                suggester = AISuggester(api_key=GEMINI_KEY or None, groq_key=GROQ_KEY or None)
+                suggester = AISuggester(
+                    api_key=GEMINI_KEY or None,
+                    groq_key=GROQ_KEY or None,
+                    aws_access_key=AWS_ACCESS_KEY or None,
+                    aws_secret_key=AWS_SECRET_KEY or None,
+                    aws_region=AWS_REGION,
+                )
 
                 # ── Ask Gemini for holistic ATS score (more accurate than TF-IDF alone) ──
                 ai_score = None
@@ -540,6 +579,13 @@ if analyze_clicked:
                 st.session_state.analysis_done = True
                 st.session_state.fixed_sections = {}
                 st.session_state.generated_sections = {}
+                # ── Reset CV builder so it doesn't show previous resume's data ──
+                cv_keys_to_clear = [k for k in st.session_state.keys()
+                                    if k.startswith('cv_') or k in ('_impl_parsed', 'pending_keywords')]
+                for k in cv_keys_to_clear:
+                    del st.session_state[k]
+                # cv_prefilled=False forces the "detected" banner → auto-fill prompt
+                st.session_state.cv_prefilled = False
 
             except Exception as e:
                 status.empty(); progress.empty()
@@ -722,30 +768,29 @@ if st.session_state.analysis_done and st.session_state.results:
                 st.markdown(f"<div style='font-size:0.85rem;font-weight:700;color:{color};"
                             f"margin:1rem 0 0.5rem'>{label}</div>", unsafe_allow_html=True)
 
-                # Card grid — 2 columns
-                cols = st.columns(2)
-                for i, kw in enumerate(kws[:20]):
-                    with cols[i % 2]:
-                        # Importance bar width
-                        imp = max(10, 100 - (kw.rank - 1) * 8)
-                        st.markdown(f"""
-                        <div style='background:{bg};border:1px solid {color}33;border-left:3px solid {color};
-                                    border-radius:8px;padding:0.6rem 0.8rem;margin-bottom:0.5rem'>
-                          <div style='display:flex;justify-content:space-between;align-items:center'>
-                            <span style='font-weight:700;color:{color};font-size:0.88rem'>
-                              {icon} {kw.term}
-                            </span>
-                            <span style='font-size:0.65rem;color:#666;background:rgba(255,255,255,0.05);
-                                         padding:1px 5px;border-radius:4px'>#{kw.rank}</span>
-                          </div>
-                          <div style='background:rgba(255,255,255,0.05);border-radius:3px;
-                                      height:3px;margin:5px 0'>
-                            <div style='background:{color};width:{imp}%;height:3px;border-radius:3px'></div>
-                          </div>
-                          <div style='font-size:0.72rem;color:#888;margin-top:3px'>
-                            {kw.suggestions[0] if kw.suggestions else 'Add to Skills or Projects section'}
-                          </div>
-                        </div>""", unsafe_allow_html=True)
+                # Sort by rank so cards appear in correct order
+                sorted_kws = sorted(kws[:20], key=lambda k: k.rank)
+
+                # Render as HTML grid (2 cols) — avoids Streamlit column ordering issue
+                cards_html = "<div style='display:grid;grid-template-columns:1fr 1fr;gap:0.5rem;margin-bottom:0.5rem'>"
+                for kw in sorted_kws:
+                    imp = max(10, 100 - (kw.rank - 1) * 8)
+                    tip = (kw.suggestions[0] if kw.suggestions else 'Add to Skills or Projects section')
+                    cards_html += f"""
+                    <div style='background:{bg};border:1px solid {color}33;border-left:3px solid {color};
+                                border-radius:8px;padding:0.6rem 0.8rem'>
+                      <div style='display:flex;justify-content:space-between;align-items:center'>
+                        <span style='font-weight:700;color:{color};font-size:0.85rem'>{icon} {kw.term}</span>
+                        <span style='font-size:0.65rem;color:#777;background:rgba(255,255,255,0.05);
+                                     padding:1px 5px;border-radius:4px'>#{kw.rank}</span>
+                      </div>
+                      <div style='background:rgba(255,255,255,0.05);border-radius:3px;height:3px;margin:5px 0'>
+                        <div style='background:{color};width:{imp}%;height:3px;border-radius:3px'></div>
+                      </div>
+                      <div style='font-size:0.7rem;color:#888;margin-top:3px'>{tip}</div>
+                    </div>"""
+                cards_html += "</div>"
+                st.markdown(cards_html, unsafe_allow_html=True)
 
             # Quick-add to CV builder
             st.markdown("---")

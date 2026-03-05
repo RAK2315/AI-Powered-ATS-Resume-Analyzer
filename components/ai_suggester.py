@@ -1,11 +1,19 @@
 """
 AI Suggester Component
-Generates improvement recommendations using Gemini or Groq (Llama) as fallback.
+Generates improvement recommendations using Amazon Bedrock (primary),
+Groq/Llama (secondary), or Google Gemini (tertiary).
 """
 
 import time
+import json
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+try:
+    import boto3
+    BEDROCK_AVAILABLE = True
+except ImportError:
+    BEDROCK_AVAILABLE = False
 
 try:
     import google.generativeai as genai
@@ -38,96 +46,167 @@ class PrioritizedSuggestion:
 
 
 def _build_smart_suggestions(ctx: dict) -> list:
-    """Build resume-specific suggestions without AI, based on actual analysis data."""
+    """Build resume-specific suggestions based on actual analysis data and candidate mode."""
     score            = ctx.get('score', 50)
     missing_keywords = ctx.get('missing_keywords', [])
     missing_sections = ctx.get('missing_sections', [])
     section_improv   = ctx.get('section_improvements', [])
-    job_desc         = ctx.get('job_desc', '')
     candidate_mode   = ctx.get('candidate_mode', '')
-    is_fresher       = 'Student' in candidate_mode or 'Fresher' in candidate_mode or 'Intern' in candidate_mode
+
+    is_fresher  = 'Student' in candidate_mode or 'Fresher' in candidate_mode
+    is_intern   = 'Intern' in candidate_mode
+    is_pro      = 'Professional' in candidate_mode
+    is_student  = is_fresher or is_intern
 
     suggestions = []
 
-    # 1. Missing keywords — most impactful
+    # 1. Missing keywords — always relevant, phrasing changes by mode
     if missing_keywords:
         top_kws = ', '.join(f'"{k}"' for k in missing_keywords[:5])
+        if is_pro:
+            tip = (f"Add these JD keywords to your Skills section: {top_kws}. "
+                   f"Even experienced professionals lose ATS matches for missing exact keyword phrasing.")
+        else:
+            tip = (f"Add these high-priority keywords to your Skills or Projects section: {top_kws}. "
+                   f"These appear in the JD but not in your resume.")
         suggestions.append(PrioritizedSuggestion(
-            suggestion=f"Add these high-priority keywords to your Skills or Projects section: {top_kws}. These appear in the JD but not in your resume.",
-            priority=1, category="keywords", impact_estimate="High", implementation_difficulty="Low"
+            suggestion=tip, priority=1, category="keywords",
+            impact_estimate="High", implementation_difficulty="Low"
         ))
 
-    # 2. Missing sections
+    # 2. Missing sections — mode-aware
     if 'summary' in missing_sections:
+        if is_pro:
+            msg = "Add a 2-3 sentence executive summary highlighting your years of experience, key achievements, and specialization. Senior roles expect this."
+        else:
+            msg = "Add a 2-3 sentence Professional Summary tailored to this role — it's the first thing ATS systems read."
         suggestions.append(PrioritizedSuggestion(
-            suggestion="Add a 3-4 sentence Professional Summary tailored to this role. It's the first thing ATS systems and recruiters read.",
-            priority=1, category="structure", impact_estimate="High", implementation_difficulty="Low"
-        ))
-    if 'experience' in missing_sections and not is_fresher:
-        suggestions.append(PrioritizedSuggestion(
-            suggestion="Add a Work Experience section. Even internships, freelance work, or part-time roles count.",
-            priority=1, category="structure", impact_estimate="High", implementation_difficulty="Medium"
+            suggestion=msg, priority=1, category="structure",
+            impact_estimate="High", implementation_difficulty="Low"
         ))
 
-    # 3. Score-based advice
+    if 'experience' in missing_sections:
+        if is_pro:
+            suggestions.append(PrioritizedSuggestion(
+                suggestion="Your resume is missing a Work Experience section. This is critical for a Professional role — add your job history with achievements and metrics.",
+                priority=1, category="structure", impact_estimate="High", implementation_difficulty="Medium"
+            ))
+        elif not is_student:
+            suggestions.append(PrioritizedSuggestion(
+                suggestion="Add a Work Experience section. Even internships, freelance, or part-time roles count significantly.",
+                priority=1, category="structure", impact_estimate="High", implementation_difficulty="Medium"
+            ))
+        # For students/freshers — silently skip, missing experience is expected
+
+    # 3. Score-based advice — mode-aware phrasing
     if score < 50:
+        if is_pro:
+            msg = (f"Your keyword match is low ({score}/100). "
+                   f"Update your Skills section to mirror the JD's exact phrasing — "
+                   f"ATS systems do literal keyword matching regardless of experience level.")
+        else:
+            msg = (f"Keyword match is low ({score}/100). "
+                   f"Copy 3-4 exact phrases from the JD requirements directly into your Skills section.")
         suggestions.append(PrioritizedSuggestion(
-            suggestion=f"Your keyword match is low ({score}/100). Mirror the exact phrasing from the JD — ATS systems do exact-match. Try copying 3-4 job requirement phrases directly into your Skills section.",
-            priority=1, category="keywords", impact_estimate="High", implementation_difficulty="Low"
+            suggestion=msg, priority=1, category="keywords",
+            impact_estimate="High", implementation_difficulty="Low"
         ))
-    elif score < 65:
+    elif score < 70:
+        if is_pro:
+            msg = (f"Good match ({score}/100). "
+                   f"Add the missing technical keywords to your Skills section — "
+                   f"your experience is strong but ATS may filter on exact terms.")
+        else:
+            msg = (f"Good foundation ({score}/100). "
+                   f"Adding the missing keywords to your project bullets is the fastest score boost.")
         suggestions.append(PrioritizedSuggestion(
-            suggestion=f"Good foundation ({score}/100). Focus on adding the missing technical keywords above to your Projects bullets — this is the fastest way to improve your score.",
-            priority=2, category="keywords", impact_estimate="High", implementation_difficulty="Low"
+            suggestion=msg, priority=2, category="keywords",
+            impact_estimate="High", implementation_difficulty="Low"
         ))
 
-    # 4. Fresher-specific advice
-    if is_fresher:
+    # 4. Mode-specific bullet/achievement advice
+    if is_pro:
         suggestions.append(PrioritizedSuggestion(
-            suggestion="For freshers: quantify every project metric you have. Format: 'Achieved X% accuracy on N samples using Y'. Numbers dramatically increase ATS and recruiter attention.",
+            suggestion="Ensure every bullet quantifies business impact: revenue generated, team size led, % improvement, cost saved. Senior roles are evaluated on outcomes not just activities.",
             priority=2, category="experience", impact_estimate="High", implementation_difficulty="Low"
         ))
-    else:
+    elif is_intern:
         suggestions.append(PrioritizedSuggestion(
-            suggestion="Start every bullet with a strong action verb and include a measurable outcome (%, $, time saved, scale). Example: 'Reduced inference latency by 40% using model quantization'.",
-            priority=2, category="language", impact_estimate="Medium", implementation_difficulty="Low"
+            suggestion="For internship applications: highlight coursework, personal projects, and any hackathon results. Format project metrics as 'Achieved X% accuracy using Y on Z dataset'.",
+            priority=2, category="experience", impact_estimate="High", implementation_difficulty="Low"
+        ))
+    else:  # fresher/student
+        suggestions.append(PrioritizedSuggestion(
+            suggestion="Quantify every project metric you have. Format: 'Achieved X% accuracy on N samples using Y'. Numbers are what differentiate fresher resumes.",
+            priority=2, category="experience", impact_estimate="High", implementation_difficulty="Low"
         ))
 
-    # 5. Section-specific improvements from evaluator
+    # 5. Section-specific improvements from evaluator (deduplicated)
     if section_improv:
-        unique = list(dict.fromkeys(section_improv))[:2]  # deduplicate
+        unique = list(dict.fromkeys(section_improv))[:2]
         for imp in unique:
             suggestions.append(PrioritizedSuggestion(
-                suggestion=imp,
-                priority=3, category="content", impact_estimate="Medium", implementation_difficulty="Low"
+                suggestion=imp, priority=3, category="content",
+                impact_estimate="Medium", implementation_difficulty="Low"
             ))
 
-    # 6. Always-useful final tip
+    # 6. Strategy tip on keyword count
     if missing_keywords and len(missing_keywords) > 5:
+        if is_pro:
+            tip = (f"You have {len(missing_keywords)} missing keywords. "
+                   f"Focus on the top 5 technical ones that directly match your actual experience — "
+                   f"do not add skills you cannot defend in a senior interview.")
+        else:
+            tip = (f"You have {len(missing_keywords)} missing keywords. "
+                   f"Focus on the top 5 technical ones. Adding skills you don't have will hurt in interviews.")
         suggestions.append(PrioritizedSuggestion(
-            suggestion=f"You have {len(missing_keywords)} missing keywords. Don't add them all at once — focus on the top 5 technical ones. Adding skills you don't have will hurt you in interviews.",
-            priority=3, category="strategy", impact_estimate="Medium", implementation_difficulty="Low"
+            suggestion=tip, priority=3, category="strategy",
+            impact_estimate="Medium", implementation_difficulty="Low"
         ))
 
-    return suggestions[:7]  # cap at 7
+    return suggestions[:7]
 
 
 FALLBACK_SUGGESTIONS = _build_smart_suggestions({})  # empty fallback for import safety
 
 
 class AISuggester:
-    """Generates AI-powered resume improvement suggestions using Google Gemini."""
+    """Generates AI-powered resume improvement suggestions.
+    Priority: Amazon Bedrock (Claude 3.5 Haiku) → Groq (Llama 3.3) → Google Gemini.
+    """
 
     MAX_RETRIES = 3
     RETRY_DELAY = 2
 
-    def __init__(self, api_key: Optional[str] = None, groq_key: Optional[str] = None):
-        self.api_key  = api_key
-        self.groq_key = groq_key
-        self.model    = None   # Gemini model
-        self.groq     = None   # Groq client
+    def __init__(self, api_key: Optional[str] = None, groq_key: Optional[str] = None,
+                 aws_access_key: Optional[str] = None, aws_secret_key: Optional[str] = None,
+                 aws_region: str = 'us-east-1'):
+        self.model   = None   # Gemini
+        self.groq    = None   # Groq
+        self.bedrock = None   # Bedrock (primary)
 
-        # Init Gemini
+        # PRIMARY: Bedrock
+        if aws_access_key and aws_secret_key and BEDROCK_AVAILABLE:
+            try:
+                self.bedrock = boto3.client(
+                    'bedrock-runtime',
+                    region_name=aws_region,
+                    aws_access_key_id=aws_access_key,
+                    aws_secret_access_key=aws_secret_key,
+                )
+                print("[ATS] AI: Bedrock connected ✓")
+            except Exception:
+                self.bedrock = None
+
+        # SECONDARY: Groq
+        if groq_key and GROQ_AVAILABLE:
+            try:
+                self.groq = GroqClient(api_key=groq_key)
+                print("[ATS] AI: Groq connected ✓")
+            except Exception:
+                self.groq = None
+
+        # TERTIARY: Gemini
         if api_key and GEMINI_AVAILABLE:
             try:
                 genai.configure(api_key=api_key)
@@ -136,12 +215,9 @@ class AISuggester:
                     available = [m.name for m in genai.list_models()
                                  if 'generateContent' in m.supported_generation_methods]
                     preferred = [
-                        'models/gemini-1.5-flash',
-                        'models/gemini-1.5-flash-latest',
-                        'models/gemini-1.5-flash-8b',
-                        'models/gemini-2.0-flash-lite',
-                        'models/gemini-2.0-flash',
-                        'models/gemini-1.5-pro-latest',
+                        'models/gemini-1.5-flash', 'models/gemini-1.5-flash-latest',
+                        'models/gemini-1.5-flash-8b', 'models/gemini-2.0-flash-lite',
+                        'models/gemini-2.0-flash', 'models/gemini-1.5-pro-latest',
                     ]
                     for pref in preferred:
                         if pref in available:
@@ -150,45 +226,61 @@ class AISuggester:
                 except Exception:
                     pass
                 self.model = genai.GenerativeModel(model_name)
+                print("[ATS] AI: Gemini connected ✓")
             except Exception:
                 self.model = None
 
-        # Init Groq (Llama fallback)
-        if groq_key and GROQ_AVAILABLE:
-            try:
-                self.groq = GroqClient(api_key=groq_key)
-            except Exception:
-                self.groq = None
-
     @property
     def has_ai(self) -> bool:
-        return self.model is not None or self.groq is not None
+        return self.bedrock is not None or self.groq is not None or self.model is not None
+
+    def _call_bedrock(self, prompt: str) -> str:
+        """Call Amazon Bedrock — Claude 3.5 Haiku."""
+        import json as _json
+        response = self.bedrock.converse(
+            modelId='us.anthropic.claude-haiku-4-5-20251001-v1:0',
+            messages=[{'role': 'user', 'content': [{'text': prompt}]}],
+            inferenceConfig={'maxTokens': 1024, 'temperature': 0.7}
+        )
+        return response['output']['message']['content'][0]['text'].strip()
 
     def _call_groq(self, prompt: str) -> str:
-        """Call Groq (Llama 3.3) — fast, generous free tier."""
+        """Call Groq — Llama 3.3 70B."""
         resp = self.groq.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
-            temperature=0.7,
+            max_tokens=1024, temperature=0.7,
         )
         return resp.choices[0].message.content.strip()
 
     def _call_model(self, prompt: str, max_retries: int = 1) -> str:
-        """Call Groq (primary) first, fall back to Gemini if Groq unavailable."""
-        # PRIMARY: Try Groq first (better free tier, faster, no daily cap issues)
+        """Call AI: Bedrock → Groq → Gemini."""
+
+        # PRIMARY: Bedrock
+        if self.bedrock:
+            try:
+                return self._call_bedrock(prompt)
+            except Exception as e:
+                err = str(e)
+                # Fall through on ANY Bedrock error — don't block the user
+                print(f"[ATS] Bedrock unavailable ({err[:80]}), trying Groq...")
+                # If it's a use-case/access issue, disable bedrock for this session
+                if any(x in err for x in ['ResourceNotFoundException', 'AccessDenied',
+                                           'use case', 'not submitted']):
+                    self.bedrock = None  # stop retrying this session
+
+        # SECONDARY: Groq
         if self.groq:
             try:
                 return self._call_groq(prompt)
             except Exception as e:
                 err = str(e)
                 if '429' in err or 'rate' in err.lower():
-                    # Groq rate limit — try Gemini before giving up
-                    pass
+                    print(f"[ATS] Groq rate limited, trying Gemini...")
                 else:
                     raise Exception(f"Groq error: {err[:150]}")
 
-        # FALLBACK: Gemini
+        # TERTIARY: Gemini
         if self.model:
             for attempt in range(max_retries + 1):
                 try:
@@ -197,21 +289,12 @@ class AISuggester:
                 except Exception as e:
                     err_str = str(e)
                     is_quota = '429' in err_str or 'quota' in err_str.lower()
-                    if is_quota:
-                        if attempt < max_retries:
-                            time.sleep(8)
-                            if len(prompt) > 1500:
-                                prompt = prompt[:1500] + '\n\nBe concise. Return ONLY the result.'
-                            continue
-                        raise Exception(
-                            "Both Groq and Gemini quota exceeded. "
-                            "Groq resets in ~1 min, Gemini resets daily."
-                        )
+                    if is_quota and attempt < max_retries:
+                        time.sleep(8)
+                        continue
                     raise
 
-        raise Exception(
-            "No AI connected. Add GROQ_API_KEY to .env (free at console.groq.com)."
-        )
+        raise Exception("No AI available. Add AWS credentials or GROQ_API_KEY to .env.")
 
     def generate_suggestions(self, analysis_context: dict) -> List[PrioritizedSuggestion]:
         """Generate improvement suggestions based on analysis results."""

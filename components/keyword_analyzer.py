@@ -74,9 +74,13 @@ TECH_TERMS = {
     # practices
     'agile','scrum','devops','version control','open source',
     # compound tech phrases that should stay as-is
-    'numpy pandas','pandas scikit','scikit learn',
-    'tensorflow pytorch','data preprocessing',
-    'feature engineering','model deployment',
+    'data preprocessing','feature engineering','model deployment',
+    'model optimization','hyperparameter tuning','transfer learning',
+    'natural language processing','computer vision','machine learning',
+    'deep learning','reinforcement learning','time series',
+    'linear algebra','cross-validation','dimensionality reduction',
+    'spark sql','vertex ai','azure ml','ci/cd',
+    'version control','open source',
 }
 
 SOFT_SKILL_TERMS = {
@@ -222,24 +226,43 @@ class KeywordAnalyzer:
         missing      = []
 
         for kw in job_keywords:
-            tl = kw.term.lower()
+            tl = kw.term.lower().strip()
+
+            # Direct match
             if tl in resume_lower:
                 continue
-            # Multi-word: skip if all significant words already present
+
             words = tl.split()
-            if len(words) > 1:
+
+            if len(words) == 1:
+                # Single word — also check with common variants (e.g. "pytorch" matches "pytorch,")
+                if any(tl == w.strip('.,;:/()') for w in resume_lower.split()):
+                    continue
+                # Not found
+                missing.append(MissingKeyword(
+                    term=kw.term,
+                    importance_score=kw.tfidf_score * (1 + min(kw.frequency, 5) * 0.15),
+                    category=kw.category,
+                    context=self._context(kw.category),
+                    suggestions=self._suggestions(kw.term, kw.category),
+                ))
+            else:
+                # Multi-word phrase — skip if ALL significant words are present individually
                 sig = [w for w in words
-                       if len(w) > 3 and w not in stop_words and w not in JUNK_WORDS]
+                       if len(w) > 2 and w not in stop_words and w not in JUNK_WORDS]
                 if sig and all(w in resume_lower for w in sig):
                     continue
-
-            missing.append(MissingKeyword(
-                term=kw.term,
-                importance_score=kw.tfidf_score * (1 + min(kw.frequency, 5) * 0.15),
-                category=kw.category,
-                context=self._context(kw.category),
-                suggestions=self._suggestions(kw.term, kw.category),
-            ))
+                # Also skip if the phrase appears as a substring with any separator
+                phrase_no_space = re.sub(r'\s+', r'.{0,3}', re.escape(tl))
+                if re.search(phrase_no_space, resume_lower):
+                    continue
+                missing.append(MissingKeyword(
+                    term=kw.term,
+                    importance_score=kw.tfidf_score * (1 + min(kw.frequency, 5) * 0.15),
+                    category=kw.category,
+                    context=self._context(kw.category),
+                    suggestions=self._suggestions(kw.term, kw.category),
+                ))
 
         return missing
 
