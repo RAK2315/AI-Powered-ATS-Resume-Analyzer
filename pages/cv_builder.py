@@ -545,7 +545,7 @@ def render_cv_builder(gemini_key: str = ""):
             with c1:
                 if st.button("⚡ Auto-fill from Resume", use_container_width=True):
                     with st.spinner("Parsing..."):
-                        parsed = extract_resume_structure(resume_text, suggester.model)
+                        parsed = extract_resume_structure(resume_text, suggester.model, suggester=suggester)
                         _init_from_resume(parsed)
                         st.session_state.cv_prefilled = True
                         st.rerun()
@@ -558,7 +558,7 @@ def render_cv_builder(gemini_key: str = ""):
             with st.expander("🔄 Re-parse from uploaded resume"):
                 if st.button("Re-fill all fields", use_container_width=True):
                     with st.spinner("Re-parsing..."):
-                        parsed = extract_resume_structure(resume_text, suggester.model)
+                        parsed = extract_resume_structure(resume_text, suggester.model, suggester=suggester)
                         _init_from_resume(parsed)
                         st.rerun()
 

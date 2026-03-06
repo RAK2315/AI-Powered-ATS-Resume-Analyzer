@@ -203,9 +203,21 @@ class PDFParser:
             stripped = line.strip()
             if not stripped:
                 return line
+
+            # Always fix ALL-CAPS squished section headers (e.g. TECHNICALEXPERIENCE)
+            # These are lines that are fully uppercase and longer than 10 chars with no spaces
+            if stripped.isupper() and len(stripped) > 10 and ' ' not in stripped:
+                # Insert space before known section words
+                fixed = _re.sub(
+                    r'(TECHNICAL|WORK|PERSONAL|SENIOR|JUNIOR|SOFT|KEY)'
+                    r'(EXPERIENCE|SKILLS?|PROJECTS?|SUMMARY|PROFILE)',
+                    r'\1 \2', stripped)
+                if fixed != stripped:
+                    return fixed
+
             words = stripped.split()
             avg_word_len = sum(len(w) for w in words) / max(len(words), 1)
-            if avg_word_len > 12:
+            if avg_word_len > 10:
                 # Split on camelCase boundaries
                 line = _re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', line)
                 line = _re.sub(r'(?<=[A-Z]{2})(?=[A-Z][a-z])', ' ', line)

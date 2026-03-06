@@ -625,7 +625,7 @@ if st.session_state.analysis_done and st.session_state.results:
             _s = _AI(api_key=GEMINI_KEY or None, groq_key=GROQ_KEY or None)
             try:
                 from components.resume_extractor import ParsedResume
-                _parsed = extract_resume_structure(r['resume_text'], _s.model or _s.groq)
+                _parsed = extract_resume_structure(r['resume_text'], _s.model, suggester=_s)
                 # Store parsed data so cv_builder can load it directly
                 st.session_state['_impl_parsed'] = _parsed
             except Exception:

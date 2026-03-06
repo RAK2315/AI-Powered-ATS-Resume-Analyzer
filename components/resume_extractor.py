@@ -29,16 +29,23 @@ SECTION_HEADERS = re.compile(
     r'^(PROFILE|SUMMARY|ABOUT(?:\s+ME)?|OBJECTIVE|'
     r'EDUCATION|ACADEMIC|'
     r'SKILLS?|TECHNICAL\s+SKILLS?|'
-    r'EXPERIENCE|WORK\s+EXPERIENCE|EMPLOYMENT|'
+    r'TECHNICAL\s+EXPERIENCE|EXPERIENCE|WORK\s+EXPERIENCE|EMPLOYMENT|'
     r'PROJECTS?|PERSONAL\s+PROJECTS?|'
     r'CERTIFICATIONS?|COURSES?|TRAINING|'
+    r'INTERNSHIPS?(?:[\s/]+CERTIFICATIONS?(?:[\s\w]*)?)?|'
     r'AWARDS?|ACHIEVEMENTS?|HONORS?|PUBLICATIONS?|'
     r'LANGUAGES?|INTERESTS?|ACTIVITIES?)\s*$',
     re.IGNORECASE
 )
 
 
-def extract_resume_structure(text: str, gemini_model=None) -> ParsedResume:
+def extract_resume_structure(text: str, gemini_model=None, suggester=None) -> ParsedResume:
+    # Try AI extraction first — use suggester (Bedrock/Groq/Gemini) if available
+    if suggester and suggester.has_ai:
+        result = _extract_with_ai(text, suggester)
+        if result and result.name:
+            return result
+    # Fall back to Gemini model directly if passed
     if gemini_model:
         result = _extract_with_gemini(text, gemini_model)
         if result and result.name:
@@ -118,6 +125,106 @@ Rules:
         return None
 
 
+def _extract_with_ai(text: str, suggester) -> Optional[ParsedResume]:
+    """Extract resume structure using any available AI (Bedrock/Groq/Gemini via suggester)."""
+    import json
+
+    # Pre-clean squished PDF text before sending to AI
+    import re as _re
+    clean = text
+    # Fix camelCase squish: MLengineer → ML engineer
+    clean = _re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', clean)
+    clean = _re.sub(r'(?<=[A-Z]{2})(?=[A-Z][a-z])', ' ', clean)
+    # Normalize repeated spaces
+    clean = _re.sub(r'[ \t]{2,}', ' ', clean)
+
+    # Insert blank lines before likely job title lines (e.g. "ML Engineer(Full-time) 01/2023 05/2023")
+    # Pattern: line starting with a job-title-like phrase followed by dates
+    clean = _re.sub(
+        r'\n((?:Lead|Senior|Junior|Staff|Principal|ML|AI|Software|Data|Cloud|Backend|Frontend|Full[\s-]?Stack)'
+        r'\s+\w+[\w\s]*?\s+\d{2}/\d{2,4})',
+        r'\n\n\1', clean)
+
+    # Also insert blank line before company lines that follow a job title date line
+    clean = _re.sub(r'(\d{2}/\d{2,4})\n([A-Z][^\n]{2,40}(?:Remote|Delhi|Mumbai|Bangalore|Hyderabad|Noida|USA|UK|IN)\b)',
+                    r'\1\n\n\2', clean)
+
+    prompt = f"""Parse this resume into structured JSON. Extract ALL content accurately.
+
+RESUME TEXT:
+{clean[:4500]}
+
+Return ONLY valid JSON (no markdown, no backticks):
+{{
+  "name": "full name from top of resume",
+  "tagline": "professional title line e.g. 'Lead AI Engineer' or 'CS Student'",
+  "email": "email address",
+  "phone": "phone number as string",
+  "location": "city, country",
+  "linkedin": "linkedin url or empty string",
+  "github": "github url or username or empty string",
+  "summary": "complete profile/summary paragraph verbatim",
+  "experiences": [
+    {{
+      "title": "job title e.g. 'Lead AI Engineer'",
+      "company": "company name",
+      "location": "city",
+      "start": "start date",
+      "end": "end date or Present",
+      "bullets": ["each bullet point as complete sentence", "combine wrapped lines"]
+    }}
+  ],
+  "projects": [
+    {{
+      "name": "project name only, no dates",
+      "tech": "tech stack or empty string",
+      "link": "github/demo link or empty string",
+      "start": "start date or empty",
+      "end": "end date or empty",
+      "bullets": ["each bullet as complete sentence"]
+    }}
+  ],
+  "skills": [
+    {{"category": "exact category name from resume", "items": "exact items as comma-separated string"}}
+  ],
+  "educations": [
+    {{
+      "degree": "full degree name",
+      "institution": "university name",
+      "location": "city",
+      "start": "start date or empty",
+      "end": "graduation date or Present",
+      "gpa": "gpa/percentage or empty",
+      "courses": "relevant coursework as comma-separated string or empty"
+    }}
+  ],
+  "certifications": ["only actual certifications/courses, not awards"]
+}}
+
+Rules:
+1. Extract ALL work experience entries — there may be 3-5 separate jobs, do NOT merge them
+2. Each job has its own title, company, dates and bullets — identify them carefully
+3. In squished PDF text, job boundaries are: "Title Date1 Date2 / Company Location" pattern
+4. Bullets are the long squished sentences after the company line — split them by sentence
+5. If multiple roles are at the same company (e.g. Lead AI Engineer AND Senior AI Engineer at Techolution), create SEPARATE experience entries for each
+6. Combine line-wrapped text into complete sentences
+7. Skills: use EXACT category names from the resume
+8. Do NOT put awards in certifications array
+9. If text is squished (no spaces between words), use context to determine word boundaries"""
+
+    try:
+        raw = suggester._call_model(prompt)
+        raw = re.sub(r'^```(?:json)?\s*\n?', '', raw)
+        raw = re.sub(r'\n?```\s*$', '', raw)
+        raw = raw.strip()
+        data = json.loads(raw)
+        return ParsedResume(**{k: data.get(k, v)
+                               for k, v in ParsedResume().__dict__.items()})
+    except Exception as e:
+        print(f"AI resume parse error: {e}")
+        return None
+
+
 def _extract_with_regex(text: str) -> ParsedResume:
     result = ParsedResume()
     lines = [l.rstrip() for l in text.split('\n')]
@@ -155,13 +262,19 @@ def _extract_with_regex(text: str) -> ParsedResume:
         if SECTION_HEADERS.match(stripped):
             if current_key is not None:
                 sections.setdefault(current_key, []).extend(current_lines)
-            # Normalize key
-            key = stripped.upper().split()[0]
-            key = {'PROFILE': 'SUMMARY', 'ABOUT': 'SUMMARY', 'WORK': 'EXPERIENCE',
-                   'EMPLOYMENT': 'EXPERIENCE', 'PERSONAL': 'PROJECTS',
-                   'TECHNICAL': 'SKILLS', 'COURSE': 'CERTIFICATIONS',
-                   'TRAINING': 'CERTIFICATIONS', 'AWARD': 'AWARDS',
-                   'ACHIEVEMENT': 'AWARDS', 'HONOR': 'AWARDS'}.get(key, key)
+            # Normalize key — check full phrase before falling back to first word
+            stripped_upper = stripped.upper()
+            if re.match(r'TECHNICAL\s+EXPERIENCE', stripped_upper):
+                key = 'EXPERIENCE'
+            elif re.match(r'TECHNICAL\s+SKILLS?', stripped_upper):
+                key = 'SKILLS'
+            else:
+                key = stripped_upper.split()[0]
+                key = {'PROFILE': 'SUMMARY', 'ABOUT': 'SUMMARY', 'WORK': 'EXPERIENCE',
+                       'EMPLOYMENT': 'EXPERIENCE', 'PERSONAL': 'PROJECTS',
+                       'TECHNICAL': 'SKILLS', 'COURSE': 'CERTIFICATIONS',
+                       'TRAINING': 'CERTIFICATIONS', 'AWARD': 'AWARDS',
+                       'ACHIEVEMENT': 'AWARDS', 'HONOR': 'AWARDS'}.get(key, key)
             current_key = key
             current_lines = []
         elif current_key is not None:
